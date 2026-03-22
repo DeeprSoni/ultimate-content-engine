@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Content Machine — Dashboard</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 20px; max-width: 900px; margin: 0 auto; }
+h1 { font-size: 24px; margin-bottom: 4px; }
+.subtitle { color: #888; margin-bottom: 24px; font-size: 14px; }
+.section { background: #161616; border: 1px solid #2a2a2a; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+.section h2 { font-size: 16px; color: #fff; margin-bottom: 12px; }
+.status-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+.status-card { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 14px; }
+.status-card .label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+.status-card .value { font-size: 18px; font-weight: 600; margin-top: 4px; }
+.green { color: #4ade80; }
+.yellow { color: #facc15; }
+.red { color: #f87171; }
+.cmd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.cmd-btn { background: #1e293b; border: 1px solid #334155; color: #e0e0e0; padding: 12px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; text-align: left; transition: all 0.15s; }
+.cmd-btn:hover { background: #334155; border-color: #4ade80; }
+.cmd-btn:active { transform: scale(0.98); }
+.cmd-btn .desc { font-size: 11px; color: #888; margin-top: 2px; }
+.response-box { background: #0d1117; border: 1px solid #333; border-radius: 8px; padding: 14px; margin-top: 12px; font-family: monospace; font-size: 13px; min-height: 40px; white-space: pre-wrap; display: none; }
+.input-row { display: flex; gap: 8px; margin-top: 8px; }
+.input-row input { flex: 1; background: #1a1a1a; border: 1px solid #333; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 14px; }
+.input-row button { background: #4ade80; color: #000; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 14px; }
+.input-row button:hover { background: #22c55e; }
+.gen-box { background: #0d1117; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-top: 12px; display: none; }
+.gen-box h3 { font-size: 14px; color: #4ade80; margin-bottom: 8px; }
+.gen-box p { font-size: 14px; line-height: 1.5; }
+.links { display: flex; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+.links a { color: #60a5fa; text-decoration: none; font-size: 13px; padding: 8px 16px; border: 1px solid #334155; border-radius: 6px; }
+.links a:hover { background: #1e293b; }
+.loader { display: none; color: #facc15; font-size: 13px; margin-top: 8px; }
+.schedule-table { width: 100%; font-size: 13px; }
+.schedule-table td { padding: 6px 0; border-bottom: 1px solid #222; }
+.schedule-table td:first-child { color: #888; width: 140px; }
+.post-card { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
+.post-card .post-meta { font-size: 11px; color: #888; margin-bottom: 6px; display: flex; gap: 8px; align-items: center; }
+.post-card .post-content { font-size: 14px; line-height: 1.4; white-space: pre-wrap; }
+.post-card .tag { background: #1e293b; color: #60a5fa; padding: 1px 6px; border-radius: 3px; font-size: 10px; }
+.pending-actions { margin-top: 8px; display: flex; gap: 6px; }
+.pending-actions button { font-size: 12px; padding: 4px 12px; border-radius: 4px; cursor: pointer; border: 1px solid #333; }
+.post-actions { margin-top: 8px; display: flex; gap: 6px; }
+.btn-action { font-size: 12px; padding: 4px 12px; border-radius: 4px; cursor: pointer; border: 1px solid #333; text-decoration: none; display: inline-block; }
+.btn-copy { background: #1e293b; color: #e0e0e0; }
+.btn-copy:hover { background: #334155; }
+.btn-tweet { background: #0c4a6e; color: #38bdf8; border-color: #0c4a6e; }
+.btn-tweet:hover { background: #075985; }
+.btn-linkedin { background: #1e3a5f; color: #60a5fa; border-color: #1e3a5f; }
+.btn-linkedin:hover { background: #1e40af; }
+.btn-approve { background: #166534; color: #4ade80; border-color: #166534; }
+.btn-reject { background: #7f1d1d; color: #f87171; border-color: #7f1d1d; }
+.btn-approve:hover { background: #15803d; }
+.btn-reject:hover { background: #991b1b; }
+.empty-state { color: #666; font-size: 13px; padding: 12px 0; }
+</style>
+</head>
+<body>
+
+<h1>Content Machine</h1>
+<p class="subtitle">Multi-account autonomous content system | Deep Soni</p>
+
+<div class="section">
+  <h2>System Status</h2>
+  <div class="status-grid">
+    <div class="status-card"><div class="label">n8n Workflows</div><div class="value" id="st-workflows">Checking...</div></div>
+    <div class="status-card"><div class="label">Ollama LLM</div><div class="value" id="st-ollama">Checking...</div></div>
+    <div class="status-card"><div class="label">Content Hub</div><div class="value" id="st-hub">Checking...</div></div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Pending Approvals</h2>
+  <div id="pendingList"><div class="empty-state">Loading...</div></div>
+</div>
+
+<div class="section">
+  <h2>Recently Published</h2>
+  <div id="publishedList"><div class="empty-state">Loading...</div></div>
+</div>
+
+<div class="section">
+  <h2>Command Center</h2>
+  <p style="font-size:13px; color:#888; margin-bottom:12px;">Same commands you would send via the dashboard. Click to execute instantly.</p>
+  <div class="cmd-grid">
+    <button class="cmd-btn" onclick="sendCmd('approve')">Approve Post<div class="desc">Approve the pending draft for posting</div></button>
+    <button class="cmd-btn" onclick="sendCmd('skip')">Skip Post<div class="desc">Skip today's post, don't publish</div></button>
+    <button class="cmd-btn" onclick="sendCmd('pause')">Pause Machine<div class="desc">Stop all automated posting</div></button>
+    <button class="cmd-btn" onclick="sendCmd('resume')">Resume Machine<div class="desc">Restart automated posting</div></button>
+    <button class="cmd-btn" onclick="sendCmd('stats')">View Stats<div class="desc">Get system statistics</div></button>
+    <button class="cmd-btn" onclick="sendCmd('change')">Switch to Trend<div class="desc">Change today's plan to trending topic</div></button>
+    <button class="cmd-btn" onclick="sendCmd('trust 2')">Trust Level 2<div class="desc">Auto-post if trend score above threshold</div></button>
+    <button class="cmd-btn" onclick="sendCmd('trust 0')">Trust Level 0<div class="desc">Auto-publish everything, no approval needed</div></button>
+  </div>
+  <div class="input-row">
+    <input type="text" id="customCmd" placeholder="Type a command... e.g. 'post about AI agents' or 'edit Here is my version'" onkeydown="if(event.key==='Enter')sendCmd(this.value)" />
+    <button onclick="sendCmd(document.getElementById('customCmd').value)">Send</button>
+  </div>
+  <div class="loader" id="cmdLoader">Sending command...</div>
+  <div class="response-box" id="cmdResponse"></div>
+</div>
+
+<div class="section">
+  <h2>Generate Content Now</h2>
+  <p style="font-size:13px; color:#888; margin-bottom:12px;">Enter a tweet idea. The AI will generate LinkedIn and Threads adaptations using Ollama.</p>
+  <div class="input-row">
+    <input type="text" id="tweetInput" placeholder="Enter a tweet idea..." value="Every founder should build in public. It compounds trust faster than any ad campaign." onkeydown="if(event.key==='Enter')generateContent()" />
+    <button onclick="generateContent()">Generate</button>
+  </div>
+  <div class="loader" id="genLoader">Generating with Ollama (15-30 seconds)...</div>
+  <div class="gen-box" id="genResult"></div>
+</div>
+
+<div class="section">
+  <h2>Automated Schedule (IST)</h2>
+  <table class="schedule-table">
+    <tr><td>6:00 AM daily</td><td><strong>Morning Brief</strong> — scans trends, plans content calendar</td></tr>
+    <tr><td>7:00 AM daily</td><td><strong>Daily Generator</strong> — writes posts for both accounts, publishes to Content Hub</td></tr>
+    <tr><td>1:00 PM daily</td><td><strong>Trend Reactor</strong> — mid-day trend scan, creates hot take if score high enough</td></tr>
+    <tr><td>7:00 PM daily</td><td><strong>Trend Reactor</strong> — evening trend scan</td></tr>
+    <tr><td>6:00 PM Sunday</td><td><strong>Analytics Loop</strong> — weekly performance digest and learnings</td></tr>
+    <tr><td>On demand</td><td><strong>Repurposer</strong> — adapts any tweet for LinkedIn + Threads</td></tr>
+    <tr><td>On demand</td><td><strong>Command Handler</strong> — your commands from this dashboard</td></tr>
+  </table>
+</div>
+
+<div class="section">
+  <h2>Quick Links</h2>
+  <div class="links">
+    <a href="//" target="_blank" id="link-n8n">n8n Workflow Editor</a>
+    <a href="//" target="_blank" id="link-hub">Content Hub (Public Site)</a>
+    <a href="//" target="_blank" id="link-executions">Execution History</a>
+    <a href="//" target="_blank" id="link-rss">RSS Feed</a>
+  </div>
+</div>
+
+<script>
+var HOST = window.location.hostname;
+var N8N = "http://" + HOST + ":5678";
+var HUB = "http://" + HOST + ":3000";
+var OLLAMA = "http://" + HOST + ":11434";
+
+document.getElementById("link-n8n").href = N8N;
+document.getElementById("link-hub").href = HUB;
+document.getElementById("link-executions").href = N8N + "/executions";
+document.getElementById("link-rss").href = HUB + "/rss.xml";
+
+function sendCmd(text) {
+  if (!text) return;
+  var loader = document.getElementById("cmdLoader");
+  var box = document.getElementById("cmdResponse");
+  loader.style.display = "block";
+  box.style.display = "none";
+  fetch(N8N + "/webhook/intrkt-commands", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: text })
+  }).then(function(res) {
+    return res.text().then(function(body) {
+      var msg = "Command '" + text + "' executed (status " + res.status + ")";
+      try {
+        var parsed = JSON.parse(body);
+        if (parsed.ack) msg = parsed.ack;
+      } catch(e) {}
+      box.textContent = msg;
+      box.style.display = "block";
+      loader.style.display = "none";
+    });
+  }).catch(function(e) {
+    box.textContent = "Error: " + e.message;
+    box.style.display = "block";
+    loader.style.display = "none";
+  });
+  document.getElementById("customCmd").value = "";
+}
+
+function generateContent() {
+  var tweet = document.getElementById("tweetInput").value;
+  if (!tweet) return;
+  var loader = document.getElementById("genLoader");
+  var box = document.getElementById("genResult");
+  loader.style.display = "block";
+  box.style.display = "none";
+  fetch(N8N + "/webhook/repurposer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      tweet: tweet,
+      linkedin_draft: tweet,
+      context_block: "IDENTITY: Tech founder, AI builder. VOICE: Direct, opinionated, no corporate speak.",
+      agent_content_creator: "You adapt content for different platforms. Keep the original voice authentic.",
+      profile_id: "deep_personal"
+    })
+  }).then(function(res) {
+    return res.text().then(function(body) {
+      var html = "<h3>Original Tweet</h3><p>" + tweet + "</p>";
+      html += "<h3 style='margin-top:12px'>Sent to Repurposer</h3><p>Content will appear on the Content Hub once Ollama processes it. Check the published posts section below.</p>";
+      box.innerHTML = html;
+      box.style.display = "block";
+      loader.style.display = "none";
+      setTimeout(loadPublished, 5000);
+    });
+  }).catch(function(e) {
+    box.innerHTML = "<p style='color:#f87171'>Error: " + e.message + "</p>";
+    box.style.display = "block";
+    loader.style.display = "none";
+  });
+}
+
+function checkStatus() {
+  fetch(N8N + "/healthz").then(function() {
+    document.getElementById("st-workflows").innerHTML = "<span class='green'>6 Active</span>";
+  }).catch(function() {
+    document.getElementById("st-workflows").innerHTML = "<span class='red'>Offline</span>";
+  });
+
+  fetch(OLLAMA + "/api/tags").then(function(r) { return r.json(); }).then(function(data) {
+    var model = (data.models && data.models[0]) ? data.models[0].name : "unknown";
+    document.getElementById("st-ollama").innerHTML = "<span class='green'>" + model + "</span>";
+  }).catch(function() {
+    document.getElementById("st-ollama").innerHTML = "<span class='yellow'>Check manually</span>";
+  });
+
+  fetch(HUB + "/api/health").then(function(r) { return r.json(); }).then(function(data) {
+    document.getElementById("st-hub").innerHTML = "<span class='green'>" + data.posts + " posts</span>";
+  }).catch(function() {
+    document.getElementById("st-hub").innerHTML = "<span class='red'>Offline</span>";
+  });
+}
+
+function loadPublished() {
+  fetch(HUB + "/api/posts?limit=10").then(function(r) { return r.json(); }).then(function(data) {
+    var el = document.getElementById("publishedList");
+    if (!data.data || data.data.length === 0) {
+      el.innerHTML = '<div class="empty-state">No published posts yet. Content will appear here when the machine starts running.</div>';
+      return;
+    }
+    data.data.forEach(function(p) { postCache[p.id] = p; });
+    el.innerHTML = data.data.map(function(p) {
+      var date = new Date(p.published_at).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+      var tweetUrl = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(p.content);
+      var linkedinUrl = 'https://www.linkedin.com/sharing/share-offsite/?url=' + encodeURIComponent(p.content_full?.linkedin_draft || p.content);
+      return '<div class="post-card">' +
+        '<div class="post-meta"><span>' + esc(p.display_name) + '</span><span class="tag">' + esc(p.platform) + '</span>' +
+        (p.pillar ? '<span class="tag">' + esc(p.pillar) + '</span>' : '') +
+        '<span>' + date + '</span></div>' +
+        '<div class="post-content">' + esc(p.content).slice(0, 300) + '</div>' +
+        '<div class="post-actions">' +
+        '<button class="btn-action btn-copy" onclick="copyPost(\'' + p.id + '\', this)">Copy</button>' +
+        '<a class="btn-action btn-tweet" href="' + tweetUrl + '" target="_blank">Tweet</a>' +
+        '<a class="btn-action btn-linkedin" href="' + linkedinUrl + '" target="_blank">LinkedIn</a>' +
+        '</div></div>';
+    }).join('');
+  }).catch(function() {
+    document.getElementById("publishedList").innerHTML = '<div class="empty-state">Could not load posts. Is Content Hub running?</div>';
+  });
+}
+
+function loadPending() {
+  fetch(HUB + "/api/pending").then(function(r) { return r.json(); }).then(function(data) {
+    var el = document.getElementById("pendingList");
+    if (!data.data || data.data.length === 0) {
+      el.innerHTML = '<div class="empty-state">No pending approvals.</div>';
+      return;
+    }
+    el.innerHTML = data.data.map(function(p) {
+      var date = new Date(p.created_at).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+      return '<div class="post-card">' +
+        '<div class="post-meta"><span>' + esc(p.display_name) + '</span><span class="tag">' + esc(p.platform) + '</span>' +
+        (p.pillar ? '<span class="tag">' + esc(p.pillar) + '</span>' : '') +
+        '<span>' + date + '</span></div>' +
+        '<div class="post-content">' + esc(p.content).slice(0, 300) + '</div>' +
+        '<div class="pending-actions">' +
+        '<button class="btn-approve" onclick="approvePost(\'' + p.id + '\')">Approve</button>' +
+        '<button class="btn-reject" onclick="rejectPost(\'' + p.id + '\')">Reject</button>' +
+        '</div></div>';
+    }).join('');
+  }).catch(function() {
+    document.getElementById("pendingList").innerHTML = '<div class="empty-state">Could not load pending posts. Is Content Hub running?</div>';
+  });
+}
+
+function approvePost(id) {
+  fetch(HUB + "/api/approve/" + id, { method: "POST" }).then(function() {
+    loadPending();
+    loadPublished();
+  });
+}
+
+function rejectPost(id) {
+  fetch(HUB + "/api/reject/" + id, { method: "POST" }).then(function() {
+    loadPending();
+  });
+}
+
+var postCache = {};
+
+function copyPost(id, btn) {
+  var p = postCache[id];
+  if (!p) return;
+  navigator.clipboard.writeText(p.content).then(function() {
+    btn.textContent = 'Copied!';
+    setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
+  });
+}
+
+function esc(s) {
+  var d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
+checkStatus();
+loadPublished();
+loadPending();
+</script>
+</body>
+</html>

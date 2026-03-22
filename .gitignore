@@ -1,0 +1,7 @@
+.env
+node_modules/
+seed/node_modules/
+*.log
+
+# User data (generated at runtime)
+data/

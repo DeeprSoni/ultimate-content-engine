@@ -1,0 +1,102 @@
+version: "3.8"
+
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: always
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=${N8N_HOST}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://${N8N_HOST}/
+      - N8N_EDITOR_BASE_URL=https://${N8N_HOST}/
+      - N8N_SECURE_COOKIE=false
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_USER_MANAGEMENT_JWT_SECRET=${N8N_JWT_SECRET}
+      - N8N_DEFAULT_BINARY_DATA_MODE=filesystem
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=72
+      - NODE_FUNCTION_ALLOW_BUILTIN=*
+      - NODE_FUNCTION_ALLOW_EXTERNAL=*
+      - N8N_COMMUNITY_PACKAGES_ENABLED=true
+      - TZ=Asia/Kolkata
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
+      - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - content_data:/data
+    networks:
+      - cm_net
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: always
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - cm_net
+    # GPU support: uncomment if NVIDIA GPU available
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: always
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    networks:
+      - cm_net
+
+  content-hub:
+    build: ./content-hub
+    container_name: content-hub
+    restart: always
+    ports:
+      - "3030:3000"
+    environment:
+      - SITE_TITLE=Content Machine
+      - SITE_URL=https://uncertainty-drivers-prisoner-reflections.trycloudflare.com
+      - DATA_DIR=/data
+      - NTFY_TOPIC=deep-content-machine
+      - JWT_SECRET=${JWT_SECRET}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
+      - TWITTER_API_KEY=${TWITTER_API_KEY}
+      - TWITTER_API_SECRET=${TWITTER_API_SECRET}
+      - TWITTER_ACCESS_TOKEN=${TWITTER_ACCESS_TOKEN}
+      - TWITTER_ACCESS_SECRET=${TWITTER_ACCESS_SECRET}
+      - PEXELS_API_KEY=${PEXELS_API_KEY}
+    volumes:
+      - content_data:/data
+    networks:
+      - cm_net
+
+  piper-tts:
+    build: ./tts
+    container_name: piper-tts
+    restart: always
+    networks:
+      - cm_net
+
+volumes:
+  n8n_data:
+  ollama_data:
+  content_data:
+
+networks:
+  cm_net:
+    driver: bridge
