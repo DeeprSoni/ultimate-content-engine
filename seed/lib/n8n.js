@@ -97,11 +97,12 @@ async function createWorkflow(workflow) {
 }
 
 async function activateWorkflow(id) {
-  await axios.patch(
-    `${BASE}/api/v1/workflows/${id}`,
-    { active: true },
-    { headers: headers() }
-  );
+  try {
+    await axios.post(`${BASE}/api/v1/workflows/${id}/activate`, {}, { headers: headers() });
+  } catch {
+    // Fallback for older n8n versions
+    await axios.patch(`${BASE}/api/v1/workflows/${id}`, { active: true }, { headers: headers() });
+  }
 }
 
 async function getWorkflowWebhookUrl(workflowId, path) {
