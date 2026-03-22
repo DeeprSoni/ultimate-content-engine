@@ -214,15 +214,24 @@ docker-compose up -d
 - Increased render timeout for longer reels
 - Proper recursive temp file cleanup
 
+### Phase 3 — Autonomy Engine (2026-03-22)
+- Service-to-service auth (`X-Service-Key` header) for n8n -> Content Hub internal API calls
+- WhatsApp notifications via Intrkt Flows Engine (`sendWhatsApp()` + dual-send with ntfy.sh)
+- Trust levels API: level 0 (manual), 1 (30-min auto-approve), 2 (instant publish)
+- Auto-approve endpoint for trust-level automation
+- Direct Twitter API v2 auto-posting with OAuth 1.0a signing
+- Content repurposing: tweet -> LinkedIn (300-500 words) + Threads (<300 chars) auto-generation
+- Pillar scheduling from profile config (day-of-week based)
+- Weekly analytics API (7-day aggregate, approval rates, learnings history)
+- Full WhatsApp command handler: LIST, SKIP, ALL, STATS, TRUST, PAUSE, RESUME, POST ABOUT, CHANGE, BRIEF, DIGEST, CANCEL, EDIT
+- n8n workflow helpers updated with service auth headers
+- 6 n8n workflow builders ready to seed (Morning Brief, Daily Generator, Repurposer, Trend Reactor, Analytics Loop, Command Handler)
+
 ---
 
 ## Remaining Work
-- **n8n Automation Flows** — 6 workflows for full autopilot (Morning Brief, Daily Generator, Repurposer, Trend Reactor, Analytics Loop, Command Handler)
-- **Trust Levels** — Autonomous posting (level 0: manual, 1: 30-min auto-approve, 2: instant publish)
-- **Direct Twitter/LinkedIn API Posting** — Auto-post without browser intent
-- **Content Repurposing** — Auto-adapt tweet to LinkedIn/Threads formats
-- **Weekly Analytics Digest** — LLM analysis of what worked, sent via WhatsApp
-- **Full WhatsApp Command Handler** — trust/pause/resume/stats/post-about/change
+- **Seed n8n Workflows** — Run seed/index.js to deploy 6 automation flows to n8n
+- **Intrkt Inbound Flow Update** — Wire WhatsApp commands to n8n webhook
 - **Onboarding Wizard** — Voice interview for new user context generation
 - **Admin Dashboard** — User management, credit usage, content stats
 - **Stripe Billing** — Credit packs + subscription plans (Free/Pro/Agency)

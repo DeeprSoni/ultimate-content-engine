@@ -120,6 +120,16 @@ function authMiddleware(req, res, next) {
   const publicPaths = ['/login', '/register', '/api/health', '/', '/post/', '/rss.xml'];
   if (publicPaths.some(p => req.path === p || req.path.startsWith('/post/'))) return next();
 
+  // Phase 1: Service-to-service auth (n8n → Content Hub on internal Docker network)
+  const serviceKey = req.headers['x-service-key'];
+  if (serviceKey && process.env.INTERNAL_SERVICE_KEY && serviceKey === process.env.INTERNAL_SERVICE_KEY) {
+    const targetUser = req.headers['x-target-user'] || 'user-deep-admin';
+    req.userId = targetUser;
+    req.user = getUser(targetUser) || { id: targetUser, credits: 99999, plan: 'admin', name: 'Service' };
+    req.userDataDir = getUserDataDir(targetUser);
+    return next();
+  }
+
   const token = req.cookies?.[COOKIE_NAME] || req.headers['authorization']?.replace('Bearer ', '');
   if (!token) {
     if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Not authenticated' });
@@ -357,6 +367,40 @@ function sendNotification(title, body, priority) {
   req.write(typeof body === 'string' ? body : title);
   req.end();
   console.log('Notification sent:', title);
+}
+
+// ── WhatsApp notification via Intrkt Flows Engine ────────────────────────────
+
+function sendWhatsApp(message) {
+  const apiKey = process.env.INTRKT_API_KEY;
+  const baseUrl = process.env.INTRKT_BASE_URL;
+  const phone = process.env.INTRKT_OPERATOR_PHONE;
+  if (!apiKey || !baseUrl || !phone) return;
+
+  const body = JSON.stringify({
+    action: 'trigger_interaction',
+    phone,
+    flow_id: 'flow:content-machine:outbound',
+    channel: 'wa_chat',
+    journey: { message }
+  });
+
+  const url = new URL(baseUrl);
+  const mod = url.protocol === 'https:' ? https : http;
+  const triggerReq = mod.request(baseUrl + '/api/v1/interactions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey, 'Content-Length': Buffer.byteLength(body) }
+  });
+  triggerReq.on('error', () => {});
+  triggerReq.write(body);
+  triggerReq.end();
+  console.log('WhatsApp sent:', message.slice(0, 60));
+}
+
+// Dual-send: ntfy + WhatsApp
+function notify(title, body, priority) {
+  sendNotification(title, body, priority);
+  sendWhatsApp(title + (body && body !== title ? '\n' + body : ''));
 }
 
 // ── Smart notification scheduler (iterates all tenants) ──────────────────────
@@ -635,20 +679,25 @@ app.get('/api/pending', (req, res) => {
 app.post('/api/whatsapp-command', (req, res) => {
   const pendDir = path.join(req.userDataDir, 'pending');
   const pubDir = path.join(req.userDataDir, 'published');
+  const decDir = path.join(req.userDataDir, 'decisions');
+  const stateDir = path.join(req.userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
   const { text, phone } = req.body;
   const cmd = (text || '').trim().toLowerCase();
   const pending = readJsonDir(pendDir);
 
-  if (!cmd) return res.json({ reply: 'Send a number (1/2/3) to approve, SKIP to reject all, or LIST to see pending.' });
+  if (!cmd) return res.json({ reply: 'Commands: LIST, SKIP, ALL, STATS, TRUST 0/1/2, PAUSE, RESUME, POST ABOUT <topic>, BRIEF, DIGEST, or send a number to approve.' });
 
+  // LIST pending
   if (cmd === 'list' || cmd === 'pending') {
     if (pending.length === 0) return res.json({ reply: 'No pending posts.' });
     const list = pending.slice(0, 6).map((p, i) =>
       `${i + 1}. [${p.platform}] ${(p.content || '').slice(0, 80)}...`
     ).join('\n');
-    return res.json({ reply: `${pending.length} pending:\n\n${list}\n\nReply with number to approve, SKIP ALL to reject all.` });
+    return res.json({ reply: `${pending.length} pending:\n\n${list}\n\nReply with number to approve, SKIP to reject all.` });
   }
 
+  // SKIP / REJECT all
   if (cmd === 'skip' || cmd === 'skip all' || cmd === 'reject') {
     let count = 0;
     for (const p of pending) {
@@ -657,18 +706,7 @@ app.post('/api/whatsapp-command', (req, res) => {
     return res.json({ reply: `Rejected ${count} pending posts.` });
   }
 
-  const num = parseInt(cmd);
-  if (!isNaN(num) && num >= 1 && num <= pending.length) {
-    const post = pending[num - 1];
-    post.published_at = new Date().toISOString();
-    post.status = 'published';
-    delete post.created_at;
-    fs.writeFileSync(path.join(pubDir, `${post.id}.json`), JSON.stringify(post, null, 2));
-    try { fs.unlinkSync(path.join(pendDir, `${post.id}.json`)); } catch {}
-    const preview = (post.content || '').slice(0, 100);
-    return res.json({ reply: `Approved #${num} [${post.platform}]:\n${preview}\n\nPublished. Copy from dashboard to post.` });
-  }
-
+  // APPROVE ALL
   if (cmd === 'approve all' || cmd === 'all') {
     let count = 0;
     for (const p of pending) {
@@ -679,10 +717,106 @@ app.post('/api/whatsapp-command', (req, res) => {
       try { fs.unlinkSync(path.join(pendDir, `${p.id}.json`)); } catch {}
       count++;
     }
-    return res.json({ reply: `Approved all ${count} posts. Check dashboard to tweet/copy.` });
+    return res.json({ reply: `Approved all ${count} posts.` });
   }
 
-  return res.json({ reply: `Commands:\n1-${pending.length} = approve that post\nSKIP = reject all\nLIST = see pending\nALL = approve everything` });
+  // STATS
+  if (cmd === 'stats') {
+    const published = readJsonDir(pubDir);
+    const weekAgo = new Date(Date.now() - 7 * 86400000);
+    const thisWeek = published.filter(p => new Date(p.published_at) >= weekAgo);
+    return res.json({ reply: `Stats:\nTotal published: ${published.length}\nPending: ${pending.length}\nThis week: ${thisWeek.length}\nPlatforms: ${[...new Set(published.map(p => p.platform))].join(', ')}` });
+  }
+
+  // TRUST 0/1/2
+  if (cmd.startsWith('trust ')) {
+    const lvl = parseInt(cmd.split(' ')[1]);
+    if (isNaN(lvl) || lvl < 0 || lvl > 2) return res.json({ reply: 'Usage: TRUST 0 (manual), TRUST 1 (30min auto), TRUST 2 (instant)' });
+    fs.writeFileSync(path.join(stateDir, 'trust.json'), JSON.stringify({ trust_level: lvl, updated_at: new Date().toISOString() }));
+    const labels = ['Manual approval', '30-min auto-approve', 'Instant publish'];
+    return res.json({ reply: `Trust level set to ${lvl}: ${labels[lvl]}` });
+  }
+
+  // PAUSE / RESUME
+  if (cmd === 'pause') {
+    fs.writeFileSync(path.join(stateDir, 'paused.json'), JSON.stringify({ paused: true, at: new Date().toISOString() }));
+    return res.json({ reply: 'Content generation paused. Send RESUME to restart.' });
+  }
+  if (cmd === 'resume') {
+    try { fs.unlinkSync(path.join(stateDir, 'paused.json')); } catch {}
+    return res.json({ reply: 'Content generation resumed.' });
+  }
+
+  // POST ABOUT <topic>
+  if (cmd.startsWith('post about ')) {
+    const topic = text.trim().slice(11);
+    fs.writeFileSync(path.join(stateDir, 'post_about.json'), JSON.stringify({ topic, at: new Date().toISOString() }));
+    return res.json({ reply: `Queued: will generate a post about "${topic}" on next cycle.` });
+  }
+
+  // CHANGE (switch to trending topic for today)
+  if (cmd === 'change') {
+    fs.writeFileSync(path.join(stateDir, 'override_use_trend.json'), JSON.stringify({ use_trend: true, at: new Date().toISOString() }));
+    return res.json({ reply: 'Switched today to trending topic instead of scheduled pillar.' });
+  }
+
+  // BRIEF (show last morning brief)
+  if (cmd === 'brief') {
+    try {
+      const brief = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'state/last_brief_deep_personal.json'), 'utf8'));
+      return res.json({ reply: brief.brief || 'No brief available.' });
+    } catch {
+      return res.json({ reply: 'No brief available yet. Wait for the morning scan.' });
+    }
+  }
+
+  // DIGEST (show last weekly digest)
+  if (cmd === 'digest') {
+    try {
+      const digest = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'state/last_digest_deep_personal.json'), 'utf8'));
+      return res.json({ reply: digest.digest || 'No digest available.' });
+    } catch {
+      return res.json({ reply: 'No digest available yet. Wait for Sunday evening.' });
+    }
+  }
+
+  // CANCEL (cancel last auto-posted)
+  if (cmd === 'cancel') {
+    const published = readJsonDir(pubDir);
+    const lastAuto = published.find(p => p.auto_approved);
+    if (!lastAuto) return res.json({ reply: 'No auto-approved posts to cancel.' });
+    const twoHoursAgo = Date.now() - 2 * 3600000;
+    if (new Date(lastAuto.published_at).getTime() < twoHoursAgo) return res.json({ reply: 'Cancel window expired (2 hours).' });
+    try { fs.unlinkSync(path.join(pubDir, `${lastAuto.id}.json`)); } catch {}
+    return res.json({ reply: `Cancelled: [${lastAuto.platform}] ${(lastAuto.content || '').slice(0, 80)}` });
+  }
+
+  // EDIT <number> <new text>
+  const editMatch = cmd.match(/^edit\s+(\d+)\s+(.+)/);
+  if (editMatch) {
+    const idx = parseInt(editMatch[1]) - 1;
+    if (idx < 0 || idx >= pending.length) return res.json({ reply: `No pending post #${idx + 1}.` });
+    const post = pending[idx];
+    post.content = text.trim().slice(editMatch[0].indexOf(editMatch[2]));
+    post.edited = true;
+    fs.writeFileSync(path.join(pendDir, `${post.id}.json`), JSON.stringify(post, null, 2));
+    return res.json({ reply: `Edited #${idx + 1}. Send ${idx + 1} to approve or LIST to review.` });
+  }
+
+  // Approve by number
+  const num = parseInt(cmd);
+  if (!isNaN(num) && num >= 1 && num <= pending.length) {
+    const post = pending[num - 1];
+    post.published_at = new Date().toISOString();
+    post.status = 'published';
+    delete post.created_at;
+    fs.writeFileSync(path.join(pubDir, `${post.id}.json`), JSON.stringify(post, null, 2));
+    try { fs.unlinkSync(path.join(pendDir, `${post.id}.json`)); } catch {}
+    const preview = (post.content || '').slice(0, 100);
+    return res.json({ reply: `Approved #${num} [${post.platform}]:\n${preview}` });
+  }
+
+  return res.json({ reply: `Commands: LIST, SKIP, ALL, STATS, TRUST 0/1/2, PAUSE, RESUME, POST ABOUT <topic>, BRIEF, DIGEST, CANCEL, EDIT <n> <text>, or number to approve.` });
 });
 
 // ── API: Schedule a pending post — TENANT-SCOPED ─────────────────────────────
@@ -1069,7 +1203,7 @@ app.post('/api/insight', async (req, res) => {
       }, null, 2));
     }
 
-    sendNotification('New insight generated', 'Tweet + Thread + LinkedIn + Reels from one idea');
+    notify('New insight generated', 'Tweet + Thread + LinkedIn + Reels from one idea');
 
     res.json({ ok: true, insight });
   } catch (e) {
@@ -1220,7 +1354,7 @@ app.post('/api/generate', async (req, res) => {
     };
     fs.writeFileSync(path.join(pendDir, `${id}.json`), JSON.stringify(post, null, 2));
 
-    sendNotification('New content generated', actualPlatform + ' post ready for review');
+    notify('New content generated', actualPlatform + ' post ready for review');
 
     res.json({ ok: true, id, content, platform: actualPlatform, style: chosenStyle });
   } catch (e) {
@@ -1408,7 +1542,7 @@ app.post('/api/scout', async (req, res) => {
       saved++;
     }
 
-    sendNotification('Article Scout: ' + saved + ' articles found', 'New articles with hot takes ready for review');
+    notify('Article Scout: ' + saved + ' articles found', 'New articles with hot takes ready for review');
 
     res.json({ ok: true, articles: saved });
   } catch (e) {
@@ -2245,6 +2379,306 @@ ${posts.map(p => `  <item>
 </rss>`;
   res.type('application/rss+xml').send(xml);
 });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PHASE 3: Trust Levels + Auto-Post
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── API: Trust Level ─────────────────────────────────────────────────────────
+
+app.get('/api/trust', (req, res) => {
+  const stateDir = path.join(req.userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const trustFile = path.join(stateDir, 'trust.json');
+  try {
+    const data = JSON.parse(fs.readFileSync(trustFile, 'utf8'));
+    res.json(data);
+  } catch {
+    res.json({ trust_level: 0 });
+  }
+});
+
+app.post('/api/trust', (req, res) => {
+  const { level } = req.body;
+  const lvl = parseInt(level);
+  if (isNaN(lvl) || lvl < 0 || lvl > 2) return res.status(400).json({ error: 'level must be 0, 1, or 2' });
+  const stateDir = path.join(req.userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'trust.json'), JSON.stringify({ trust_level: lvl, updated_at: new Date().toISOString() }));
+  res.json({ ok: true, trust_level: lvl });
+});
+
+// ── API: Auto-approve (for trust level 1/2 automation) ───────────────────────
+
+app.post('/api/auto-approve/:id', (req, res) => {
+  const pendDir = path.join(req.userDataDir, 'pending');
+  const pubDir = path.join(req.userDataDir, 'published');
+  const decDir = path.join(req.userDataDir, 'decisions');
+  const pendingFile = path.join(pendDir, `${req.params.id}.json`);
+  if (!fs.existsSync(pendingFile)) return res.status(404).json({ error: 'not found' });
+
+  const post = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
+  post.published_at = new Date().toISOString();
+  post.status = 'auto-approved';
+  post.auto_approved = true;
+  delete post.created_at;
+
+  fs.writeFileSync(path.join(pubDir, `${post.id}.json`), JSON.stringify(post, null, 2));
+
+  fs.mkdirSync(decDir, { recursive: true });
+  fs.writeFileSync(path.join(decDir, `${post.id}.json`), JSON.stringify({
+    type: 'approved', auto: true, post_id: post.id, platform: post.platform,
+    format: post.format || 'unknown', content_preview: (post.content || '').slice(0, 100),
+    pillar: post.pillar, at: new Date().toISOString()
+  }, null, 2));
+
+  fs.unlinkSync(pendingFile);
+
+  // Auto-post to Twitter if configured and platform is twitter
+  if (post.platform === 'twitter' && req.body.auto_post) {
+    autoPostTwitter(post).then(result => {
+      if (result.ok) {
+        post.tweet_id = result.tweet_id;
+        fs.writeFileSync(path.join(pubDir, `${post.id}.json`), JSON.stringify(post, null, 2));
+      }
+    }).catch(() => {});
+  }
+
+  res.json({ ok: true, id: post.id });
+});
+
+// ── API: Auto-post to Twitter v2 ─────────────────────────────────────────────
+
+async function autoPostTwitter(post) {
+  const apiKey = process.env.TWITTER_API_KEY;
+  const apiSecret = process.env.TWITTER_API_SECRET;
+  const accessToken = process.env.TWITTER_ACCESS_TOKEN;
+  const accessSecret = process.env.TWITTER_ACCESS_SECRET;
+  if (!apiKey || !apiSecret || !accessToken || !accessSecret) return { ok: false, error: 'Twitter API not configured' };
+
+  const url = 'https://api.twitter.com/2/tweets';
+  const method = 'POST';
+  const tweetBody = JSON.stringify({ text: post.content });
+
+  // OAuth 1.0a signing
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const nonce = crypto.randomBytes(16).toString('hex');
+
+  const params = {
+    oauth_consumer_key: apiKey,
+    oauth_nonce: nonce,
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: timestamp,
+    oauth_token: accessToken,
+    oauth_version: '1.0'
+  };
+
+  const paramString = Object.keys(params).sort().map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
+  const baseString = method + '&' + encodeURIComponent(url) + '&' + encodeURIComponent(paramString);
+  const signingKey = encodeURIComponent(apiSecret) + '&' + encodeURIComponent(accessSecret);
+  const signature = crypto.createHmac('sha1', signingKey).update(baseString).digest('base64');
+
+  const authHeader = 'OAuth ' + Object.entries({ ...params, oauth_signature: signature })
+    .map(([k, v]) => `${encodeURIComponent(k)}="${encodeURIComponent(v)}"`)
+    .join(', ');
+
+  return new Promise((resolve) => {
+    const tReq = https.request(url, {
+      method: 'POST',
+      headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(tweetBody) }
+    }, tRes => {
+      let d = '';
+      tRes.on('data', c => d += c);
+      tRes.on('end', () => {
+        try {
+          const result = JSON.parse(d);
+          if (result.data?.id) {
+            console.log('Auto-tweeted:', result.data.id);
+            resolve({ ok: true, tweet_id: result.data.id });
+          } else {
+            console.error('Twitter API error:', d.slice(0, 200));
+            resolve({ ok: false, error: d.slice(0, 200) });
+          }
+        } catch { resolve({ ok: false, error: d.slice(0, 200) }); }
+      });
+    });
+    tReq.on('error', e => resolve({ ok: false, error: e.message }));
+    tReq.write(tweetBody);
+    tReq.end();
+  });
+}
+
+app.post('/api/auto-post/:id', async (req, res) => {
+  const pubDir = path.join(req.userDataDir, 'published');
+  const file = path.join(pubDir, `${req.params.id}.json`);
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'not found' });
+
+  const post = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (post.platform !== 'twitter') return res.status(400).json({ error: 'Auto-post only supports Twitter currently' });
+
+  const result = await autoPostTwitter(post);
+  if (result.ok) {
+    post.tweet_id = result.tweet_id;
+    post.auto_posted_at = new Date().toISOString();
+    fs.writeFileSync(file, JSON.stringify(post, null, 2));
+  }
+  res.json(result);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PHASE 4: Repurposing + Pillar Scheduling
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── API: Repurpose a tweet to LinkedIn + Threads ─────────────────────────────
+
+app.post('/api/repurpose/:id', async (req, res) => {
+  const pubDir = path.join(req.userDataDir, 'published');
+  const pendDir = path.join(req.userDataDir, 'pending');
+  const ctxFile = path.join(req.userDataDir, 'contexts/default.txt');
+  const file = path.join(pubDir, `${req.params.id}.json`);
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'not found' });
+
+  const post = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_KEY) return res.status(500).json({ error: 'No GROQ_API_KEY' });
+
+  let context = '';
+  try { context = fs.readFileSync(ctxFile, 'utf8'); } catch {}
+
+  const results = [];
+
+  // Generate LinkedIn version
+  try {
+    const liPrompt = 'Original tweet:\n"' + post.content + '"\n\nExpand this into a LinkedIn post. 300-500 words. Professional but opinionated. Hook in first 2 lines. End with a question or CTA. Return ONLY the post text.';
+    const liBody = JSON.stringify({
+      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+      messages: [{ role: 'system', content: context + '\n\nYou are writing a LinkedIn post based on this tweet. Professional, structured, with a hook.' }, { role: 'user', content: liPrompt }],
+      stream: false, temperature: 0.7
+    });
+    const liResult = await new Promise((resolve, reject) => {
+      const r = https.request('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY, 'Content-Length': Buffer.byteLength(liBody) }
+      }, res2 => { let d = ''; res2.on('data', c => d += c); res2.on('end', () => resolve(d)); });
+      r.on('error', reject); r.write(liBody); r.end();
+    });
+    const liContent = JSON.parse(liResult).choices?.[0]?.message?.content || '';
+    if (liContent) {
+      const liId = generateId();
+      fs.writeFileSync(path.join(pendDir, liId + '.json'), JSON.stringify({
+        id: liId, profile_id: post.profile_id, display_name: post.display_name,
+        platform: 'linkedin', content: liContent, pillar: post.pillar,
+        format: 'repurposed', source_post_id: post.id,
+        created_at: new Date().toISOString(), status: 'pending'
+      }, null, 2));
+      results.push({ platform: 'linkedin', id: liId });
+    }
+  } catch {}
+
+  // Generate Threads version
+  try {
+    const thPrompt = 'Original tweet:\n"' + post.content + '"\n\nRewrite this as a Threads post. Casual, conversational, under 300 characters. Return ONLY the text.';
+    const thBody = JSON.stringify({
+      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+      messages: [{ role: 'system', content: context + '\n\nRewrite for Threads. Casual and short.' }, { role: 'user', content: thPrompt }],
+      stream: false, temperature: 0.8
+    });
+    const thResult = await new Promise((resolve, reject) => {
+      const r = https.request('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY, 'Content-Length': Buffer.byteLength(thBody) }
+      }, res2 => { let d = ''; res2.on('data', c => d += c); res2.on('end', () => resolve(d)); });
+      r.on('error', reject); r.write(thBody); r.end();
+    });
+    const thContent = JSON.parse(thResult).choices?.[0]?.message?.content || '';
+    if (thContent) {
+      const thId = generateId();
+      fs.writeFileSync(path.join(pendDir, thId + '.json'), JSON.stringify({
+        id: thId, profile_id: post.profile_id, display_name: post.display_name,
+        platform: 'threads', content: thContent, pillar: post.pillar,
+        format: 'repurposed', source_post_id: post.id,
+        created_at: new Date().toISOString(), status: 'pending'
+      }, null, 2));
+      results.push({ platform: 'threads', id: thId });
+    }
+  } catch {}
+
+  res.json({ ok: true, repurposed: results });
+});
+
+// ── API: Today's pillar (from profile config) ────────────────────────────────
+
+app.get('/api/pillar', (req, res) => {
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const today = dayNames[new Date().getDay()];
+  try {
+    const profilePath = path.join(DATA_DIR, 'profiles/deep_personal.json');
+    const profile = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+    const pillar = profile.pillar_schedule?.[today] || 'Build in Public';
+    res.json({ day: today, pillar, profile_id: profile.id });
+  } catch {
+    res.json({ day: today, pillar: 'Build in Public', profile_id: 'default' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PHASE 5: Analytics + Weekly Digest
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/analytics/weekly', (req, res) => {
+  const pubDir = path.join(req.userDataDir, 'published');
+  const decDir = path.join(req.userDataDir, 'decisions');
+  const weekAgo = new Date(Date.now() - 7 * 86400000);
+
+  const posts = readJsonDir(pubDir).filter(p => new Date(p.published_at) >= weekAgo);
+
+  const byPlatform = {};
+  const byFormat = {};
+  const byPillar = {};
+  for (const p of posts) {
+    byPlatform[p.platform] = (byPlatform[p.platform] || 0) + 1;
+    if (p.format) byFormat[p.format] = (byFormat[p.format] || 0) + 1;
+    if (p.pillar) byPillar[p.pillar] = (byPillar[p.pillar] || 0) + 1;
+  }
+
+  // Approval rate from decisions
+  let approved = 0, rejected = 0;
+  try {
+    const decisions = fs.readdirSync(decDir).filter(f => f.endsWith('.json'));
+    for (const f of decisions) {
+      try {
+        const d = JSON.parse(fs.readFileSync(path.join(decDir, f), 'utf8'));
+        if (new Date(d.at) < weekAgo) continue;
+        if (d.type === 'approved' || d.type === 'edited') approved++;
+        else if (d.type === 'rejected') rejected++;
+      } catch {}
+    }
+  } catch {}
+
+  res.json({
+    period: '7d',
+    total_posts: posts.length,
+    by_platform: byPlatform,
+    by_format: byFormat,
+    by_pillar: byPillar,
+    approval_rate: approved + rejected > 0 ? Math.round(approved / (approved + rejected) * 100) : 100,
+    approved, rejected
+  });
+});
+
+app.get('/api/analytics/learnings', (req, res) => {
+  const learningsFile = path.join(DATA_DIR, 'learnings', req.userId + '.json');
+  try {
+    const data = JSON.parse(fs.readFileSync(learningsFile, 'utf8'));
+    res.json(data);
+  } catch {
+    res.json({ weeks: [] });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PHASE 6: Full WhatsApp Command Handler
+// ══════════════════════════════════════════════════════════════════════════════
+// (The expanded commands are integrated into the existing /api/whatsapp-command
+//  endpoint — see the updated handler above at its original location)
 
 // ── Start ────────────────────────────────────────────────────────────────────
 

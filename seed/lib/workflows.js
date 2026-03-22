@@ -188,6 +188,10 @@ function contentHubPublishNode(id, name, position) {
     parameters: {
       method: 'POST',
       url: 'http://content-hub:3000/api/publish',
+      sendHeaders: true,
+      headerParameters: { parameters: [
+        { name: 'X-Service-Key', value: '={{ process.env.INTERNAL_SERVICE_KEY || "" }}' }
+      ]},
       sendBody: true,
       contentType: 'json',
       body: '={{ JSON.stringify({ profile_id: $json.profile_id, display_name: $json.display_name, platform: $json.primary_platform || $json.platform || "twitter", content: $json.content || $json.post_content, pillar: $json.pillar || $json.default_pillar, trend: $json.trend }) }}'
@@ -205,6 +209,10 @@ function contentHubPendingNode(id, name, position) {
     parameters: {
       method: 'POST',
       url: 'http://content-hub:3000/api/pending',
+      sendHeaders: true,
+      headerParameters: { parameters: [
+        { name: 'X-Service-Key', value: '={{ process.env.INTERNAL_SERVICE_KEY || "" }}' }
+      ]},
       sendBody: true,
       contentType: 'json',
       body: '={{ JSON.stringify({ profile_id: $json.profile_id, display_name: $json.display_name, platform: $json.primary_platform || $json.platform || "twitter", content: $json.content || $json.post_content, pillar: $json.pillar || $json.default_pillar, trend: $json.trend }) }}'
@@ -1105,7 +1113,11 @@ return ['deep_personal', 'intrkt_company'].map(id => {
       continueOnFail: true,
       parameters: {
         method: 'GET',
-        url: 'http://content-hub:3000/api/posts?limit=20'
+        url: 'http://content-hub:3000/api/posts?limit=20',
+        sendHeaders: true,
+        headerParameters: { parameters: [
+          { name: 'X-Service-Key', value: '={{ process.env.INTERNAL_SERVICE_KEY || "" }}' }
+        ]}
       }
     },
     // Analyse with Growth Hacker (Groq or Ollama)

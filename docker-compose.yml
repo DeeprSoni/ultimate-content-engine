@@ -27,6 +27,7 @@ services:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
       - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY}
+      - INTERNAL_SERVICE_KEY=${INTERNAL_SERVICE_KEY}
     volumes:
       - n8n_data:/home/node/.n8n
       - content_data:/data
@@ -80,6 +81,10 @@ services:
       - TWITTER_ACCESS_TOKEN=${TWITTER_ACCESS_TOKEN}
       - TWITTER_ACCESS_SECRET=${TWITTER_ACCESS_SECRET}
       - PEXELS_API_KEY=${PEXELS_API_KEY}
+      - INTERNAL_SERVICE_KEY=${INTERNAL_SERVICE_KEY}
+      - INTRKT_BASE_URL=${INTRKT_BASE_URL}
+      - INTRKT_API_KEY=${INTRKT_API_KEY}
+      - INTRKT_OPERATOR_PHONE=${INTRKT_OPERATOR_PHONE}
     volumes:
       - content_data:/data
     networks:
