@@ -280,17 +280,23 @@ function buildMorningBrief() {
         ]}
       }
     },
-    // Score trends with Trend Researcher agent
+    // Score trends with Trend Researcher agent (4-filter scoring)
     codeNode('score-trends', 'Score Trends', `
 const items = $input.all();
 const config = $('Load Config').first().json;
 const news = items[0].json.results || [];
 
 const systemPrompt = config.context_block + '\\n\\n' + config.agent_trend_researcher;
-const userMsg = 'Score these news items 1-10 for relevance to ' + config.display_name + '\\n' +
+const userMsg = 'Score these news items using 4 filters for ' + config.display_name + '\\n' +
   'Keywords: ' + config.trend_keywords.join(', ') + '\\n\\n' +
   'News: ' + JSON.stringify(news.slice(0,8).map(r => ({ title: r.title, description: r.content || r.description || '' }))) + '\\n\\n' +
-  'Return ONLY valid JSON array: [{"topic":"string","score":number,"angle":"string"}]';
+  'For each item, score 1-10 on four dimensions:\\n' +
+  '- relevance: Does it match the creator\\'s niche/keywords?\\n' +
+  '- audience_fit: Would their specific audience care about this?\\n' +
+  '- credibility: Is this a real, substantive development (not hype/fluff)?\\n' +
+  '- novelty: Is this a fresh angle not widely covered yet?\\n\\n' +
+  'Return ONLY valid JSON array: [{"topic":"string","angle":"string","score_breakdown":{"relevance":number,"audience_fit":number,"credibility":number,"novelty":number,"avg":number}}]\\n' +
+  'avg = arithmetic mean of the four scores. Round to 1 decimal.';
 
 return [{ json: { ...config, news_for_scoring: userMsg, system_for_scoring: systemPrompt } }];
     `, [1060, 200]),
@@ -322,23 +328,30 @@ try {
   topics = JSON.parse(raw.replace(/\\\`\\\`\\\`json|\\\`\\\`\\\`/g, '').trim());
 } catch(e) { topics = []; }
 
-const sorted = [...topics].sort((a,b) => b.score - a.score);
+// Support both 4-filter format (score_breakdown.avg) and legacy (score)
+const getScore = (t) => t.score_breakdown ? t.score_breakdown.avg : (t.score || 0);
+const sorted = [...topics].sort((a,b) => getScore(b) - getScore(a));
 const top = sorted[0];
 const threshold = config.trend_threshold;
 const opinionThreshold = config.opinion_threshold;
+const topScore = top ? getScore(top) : 0;
 
 let plan = { type: 'default', pillar: config.default_pillar };
 let brief = '';
 
-if (top && top.score >= opinionThreshold) {
-  plan = { type: 'opinion_requested', pillar: config.default_pillar, trend: top.topic, angle: top.angle, score: top.score };
+if (top && topScore >= opinionThreshold) {
+  plan = { type: 'opinion_requested', pillar: config.default_pillar, trend: top.topic, angle: top.angle, score: topScore, score_breakdown: top.score_breakdown };
+  const bd = top.score_breakdown;
+  const bdStr = bd ? ' [R:' + bd.relevance + ' A:' + bd.audience_fit + ' C:' + bd.credibility + ' N:' + bd.novelty + ']' : '';
   brief = '[' + config.display_name + '] Today: ' + config.default_pillar +
-    '\\nBig trend: "' + top.topic + '" (score ' + top.score + '/10)' +
+    '\\nBig trend: "' + top.topic + '" (' + topScore + '/10)' + bdStr +
     '\\nAngle: ' + top.angle;
-} else if (top && top.score >= threshold) {
-  plan = { type: 'trend_angle', pillar: config.default_pillar, trend: top.topic, angle: top.angle, score: top.score };
+} else if (top && topScore >= threshold) {
+  plan = { type: 'trend_angle', pillar: config.default_pillar, trend: top.topic, angle: top.angle, score: topScore, score_breakdown: top.score_breakdown };
+  const bd = top.score_breakdown;
+  const bdStr = bd ? ' [R:' + bd.relevance + ' A:' + bd.audience_fit + ' C:' + bd.credibility + ' N:' + bd.novelty + ']' : '';
   brief = '[' + config.display_name + '] Today: ' + config.default_pillar +
-    '\\nTrend angle: "' + top.topic + '" (score ' + top.score + '/10)';
+    '\\nTrend angle: "' + top.topic + '" (' + topScore + '/10)' + bdStr;
 } else {
   brief = '[' + config.display_name + '] Today: ' + config.default_pillar +
     '\\nNo strong trends found. Default post at 7AM.';

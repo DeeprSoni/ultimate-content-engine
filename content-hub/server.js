@@ -507,6 +507,172 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
+// ── Groq helper ───────────────────────────────────────────────────────────────
+
+async function callGroq(systemPrompt, userPrompt, opts) {
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_KEY) throw new Error('No GROQ_API_KEY');
+  const body = JSON.stringify({
+    model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt }
+    ],
+    stream: false,
+    temperature: opts?.temperature || 0.8,
+    max_tokens: opts?.max_tokens || 1500
+  });
+  const result = await new Promise((resolve, reject) => {
+    const req2 = https.request('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY, 'Content-Length': Buffer.byteLength(body) }
+    }, res2 => { let d = ''; res2.on('data', c => d += c); res2.on('end', () => resolve(d)); });
+    req2.on('error', reject);
+    req2.write(body);
+    req2.end();
+  });
+  const parsed = JSON.parse(result);
+  if (parsed.error) throw new Error(parsed.error.message || 'Groq error');
+  return (parsed.choices?.[0]?.message?.content || '').trim();
+}
+
+// ── Onboarding helpers ────────────────────────────────────────────────────────
+
+function isOnboardingComplete(userDataDir) {
+  const ctxFile = path.join(userDataDir, 'contexts/default.txt');
+  try {
+    const ctx = fs.readFileSync(ctxFile, 'utf8');
+    return ctx.length > 300 && !ctx.includes('Complete the onboarding') && !ctx.includes('// Customize your voice');
+  } catch { return false; }
+}
+
+// ── Story bank helpers ────────────────────────────────────────────────────────
+
+function loadStories(userDataDir) {
+  const f = path.join(userDataDir, 'stories/stories.json');
+  try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return []; }
+}
+
+function saveStoriesFile(userDataDir, stories) {
+  const f = path.join(userDataDir, 'stories/stories.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify(stories, null, 2));
+}
+
+function getRelevantStories(userDataDir, topic, limit) {
+  const stories = loadStories(userDataDir);
+  if (stories.length === 0) return [];
+  limit = limit || 3;
+  if (!topic || stories.length <= limit) return stories.slice(0, limit);
+  const topicLower = (topic || '').toLowerCase();
+  const words = topicLower.split(/\s+/).filter(w => w.length > 3);
+  const scored = stories.map(s => {
+    const blob = ((s.story || '') + ' ' + (s.lesson || '') + ' ' + (s.tags || []).join(' ')).toLowerCase();
+    const score = words.reduce((n, w) => n + (blob.includes(w) ? 1 : 0), 0);
+    return { s, score };
+  }).sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(x => x.s);
+}
+
+// ── Quality gate ──────────────────────────────────────────────────────────────
+
+const SLOP_PHRASES = [
+  "in today's fast-paced world", "it's important to note", "game-changer", "game changer",
+  "leverage", "synergy", "dive deep", "deep dive", "unpack", "delve into",
+  "at the end of the day", "the truth is", "in conclusion", "to summarize",
+  "moving forward", "going forward", "best practices", "cutting-edge", "innovative solution",
+  "transformative", "disruptive innovation", "revolutionary", "groundbreaking", "unprecedented",
+  "paradigm shift", "circle back", "let that sink in", "here's the thing",
+  "the reality is", "make no mistake", "at its core", "in a nutshell",
+  "long story short", "without further ado", "needless to say", "it goes without saying",
+  "i'm thrilled to share", "excited to announce", "passionate about"
+];
+
+function qualityGate(content, platform) {
+  const errors = [];
+  const lower = (content || '').toLowerCase();
+
+  // Slop phrases
+  for (const p of SLOP_PHRASES) {
+    if (lower.includes(p)) { errors.push('slop: "' + p + '"'); break; }
+  }
+
+  // Format gates
+  if (platform === 'twitter' && content.length > 280) {
+    errors.push('over 280 chars (' + content.length + ')');
+  }
+  if (platform === 'twitter') {
+    if (/^(a thread:|here'?s what i learned|thread:|1\/)/i.test(content.trim())) {
+      errors.push('weak thread opener as hook');
+    }
+  }
+  if (platform === 'linkedin') {
+    const lines = content.split('\n');
+    const firstEmpty = lines.findIndex((l, i) => i > 0 && l.trim() === '');
+    if (firstEmpty < 0 || firstEmpty > 4) errors.push('no line break near hook');
+  }
+  if (platform === 'reels') {
+    const firstLine = content.split('\n')[0];
+    if (firstLine.split(/\s+/).length > 10) errors.push('hook too long (max 8 words)');
+  }
+
+  // Weak hook patterns
+  if (platform === 'twitter' || platform === 'linkedin') {
+    const firstLine = content.split('\n')[0].toLowerCase();
+    if (/^(i'?ve been thinking|today i want to|let me tell you|so i was|this is a (story|thread)|i wanted to share)/.test(firstLine)) {
+      errors.push('weak hook opener');
+    }
+  }
+
+  // Specificity: must have a number OR a named entity (CapitalWord)
+  const hasNumber = /\d/.test(content);
+  const hasEntity = /\b[A-Z][a-zA-Z]{2,}/.test(content);
+  if (!hasNumber && !hasEntity) errors.push('no concrete detail (add number or named entity)');
+
+  return { pass: errors.length === 0, errors };
+}
+
+// ── Layered prompt builder ────────────────────────────────────────────────────
+
+function buildLayeredPrompt(userDataDir, pubDir, decDir, topic, platform) {
+  // Layer 1: Identity
+  let identity = '';
+  try {
+    const full = fs.readFileSync(path.join(userDataDir, 'contexts/default.txt'), 'utf8');
+    const liSection = full.indexOf('LINKEDIN — VOICE');
+    identity = liSection > 0 ? full.slice(0, liSection).trim() : full.slice(0, 4000);
+  } catch {}
+
+  // Layer 2: Performance (regen feedback learnings)
+  let performance = '';
+  try {
+    const regens = fs.readdirSync(decDir)
+      .filter(f => f.startsWith('regen-'))
+      .map(f => { try { return JSON.parse(fs.readFileSync(path.join(decDir, f), 'utf8')); } catch { return null; } })
+      .filter(Boolean).sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, 8).map(d => d.comment);
+    if (regens.length > 0) {
+      performance = '\n\nLEARNED PREFERENCES (from past feedback — apply always):\n' + regens.map(r => '- ' + r).join('\n');
+    }
+  } catch {}
+
+  // Layer 3: Stories (topic-relevant)
+  const stories = getRelevantStories(userDataDir, topic, 3);
+  const storyLayer = stories.length > 0
+    ? '\n\nREAL STORIES (weave the most relevant one in):\n' + stories.map(s => '- ' + (s.story || '') + ' (Lesson: ' + (s.lesson || '') + ')').join('\n')
+    : '';
+
+  // Layer 4: Anti-repeat (last 30 posts)
+  let antiRepeat = '';
+  try {
+    const recent = readJsonDir(pubDir).filter(p => p.platform === (platform || 'twitter')).slice(0, 30).map(p => (p.content || '').slice(0, 80));
+    if (recent.length > 0) {
+      antiRepeat = '\n\nALREADY COVERED — find a COMPLETELY DIFFERENT angle:\n' + recent.join('\n');
+    }
+  } catch {}
+
+  return identity + performance + storyLayer + antiRepeat;
+}
+
 function escapeXml(str) {
   return escapeHtml(str).replace(/'/g, '&apos;');
 }
@@ -676,7 +842,7 @@ app.get('/api/pending', (req, res) => {
 
 // ── API: WhatsApp Command — TENANT-SCOPED ─────────────────────────────────────
 
-app.post('/api/whatsapp-command', (req, res) => {
+app.post('/api/whatsapp-command', async (req, res) => {
   const pendDir = path.join(req.userDataDir, 'pending');
   const pubDir = path.join(req.userDataDir, 'published');
   const decDir = path.join(req.userDataDir, 'decisions');
@@ -728,13 +894,33 @@ app.post('/api/whatsapp-command', (req, res) => {
     return res.json({ reply: `Stats:\nTotal published: ${published.length}\nPending: ${pending.length}\nThis week: ${thisWeek.length}\nPlatforms: ${[...new Set(published.map(p => p.platform))].join(', ')}` });
   }
 
-  // TRUST 0/1/2
+  // TRUST 0/1/2 or TRUST <channel> <level>
   if (cmd.startsWith('trust ')) {
-    const lvl = parseInt(cmd.split(' ')[1]);
-    if (isNaN(lvl) || lvl < 0 || lvl > 2) return res.json({ reply: 'Usage: TRUST 0 (manual), TRUST 1 (30min auto), TRUST 2 (instant)' });
-    fs.writeFileSync(path.join(stateDir, 'trust.json'), JSON.stringify({ trust_level: lvl, updated_at: new Date().toISOString() }));
+    const parts = cmd.split(' ');
+    const channels = ['twitter', 'linkedin', 'reels', 'threads'];
+    let lvl, channel;
+    if (parts.length === 3 && channels.includes(parts[1])) {
+      channel = parts[1];
+      lvl = parseInt(parts[2]);
+    } else {
+      lvl = parseInt(parts[1]);
+    }
+    if (isNaN(lvl) || lvl < 0 || lvl > 2) return res.json({ reply: 'Usage: TRUST 0/1/2 (all channels) or TRUST twitter 2 (per channel)' });
+    const trustFile = path.join(stateDir, 'trust.json');
+    let current = {};
+    try { current = JSON.parse(fs.readFileSync(trustFile, 'utf8')); } catch {}
+    if (!current.per_channel_trust) current.per_channel_trust = { twitter: 0, linkedin: 0, reels: 0, threads: 0 };
+    if (channel) {
+      current.per_channel_trust[channel] = lvl;
+    } else {
+      current.trust_level = lvl;
+      for (const ch of Object.keys(current.per_channel_trust)) current.per_channel_trust[ch] = lvl;
+    }
+    current.updated_at = new Date().toISOString();
+    fs.writeFileSync(trustFile, JSON.stringify(current, null, 2));
     const labels = ['Manual approval', '30-min auto-approve', 'Instant publish'];
-    return res.json({ reply: `Trust level set to ${lvl}: ${labels[lvl]}` });
+    const scope = channel ? channel : 'all channels';
+    return res.json({ reply: `Trust level ${lvl} (${labels[lvl]}) set for ${scope}.` });
   }
 
   // PAUSE / RESUME
@@ -754,8 +940,28 @@ app.post('/api/whatsapp-command', (req, res) => {
     return res.json({ reply: `Queued: will generate a post about "${topic}" on next cycle.` });
   }
 
-  // CHANGE (switch to trending topic for today)
+  // CHANGE (generate 3 alt briefs for today)
   if (cmd === 'change') {
+    try {
+      const briefFile = path.join(stateDir, 'brief_today.json');
+      let currentTopic = '';
+      try { currentTopic = JSON.parse(fs.readFileSync(briefFile, 'utf8')).topic; } catch {}
+      const ctxFile = path.join(req.userDataDir, 'contexts/default.txt');
+      let ctx = '';
+      try { ctx = fs.readFileSync(ctxFile, 'utf8').slice(0, 2000); } catch {}
+      const altResult = await callGroq(
+        ctx + '\n\nGenerate 3 alternative content briefs. Return ONLY valid JSON array of 3 objects.',
+        'Current topic: "' + (currentTopic || 'none') + '". Generate 3 fresh alternatives.\n[{"topic":"...","angle":"...","framework":"...","hook_direction":"...","emotion":"..."},...]',
+        { temperature: 0.9, max_tokens: 500 }
+      );
+      const jsonMatch = altResult.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const alts = JSON.parse(jsonMatch[0]);
+        fs.writeFileSync(path.join(stateDir, 'brief_alternatives.json'), JSON.stringify({ alts, at: new Date().toISOString() }, null, 2));
+        const altText = alts.slice(0, 3).map((a, i) => `${i+1}. [${a.framework}] ${a.topic} — ${a.angle}`).join('\n');
+        return res.json({ reply: `3 alternative briefs:\n\n${altText}\n\nReply with number (1/2/3) to pick one.` });
+      }
+    } catch (e) { console.error('Change brief error:', e.message); }
     fs.writeFileSync(path.join(stateDir, 'override_use_trend.json'), JSON.stringify({ use_trend: true, at: new Date().toISOString() }));
     return res.json({ reply: 'Switched today to trending topic instead of scheduled pillar.' });
   }
@@ -938,6 +1144,230 @@ app.get('/api/decisions', (req, res) => {
   }
 });
 
+// ── API: Story Bank — TENANT-SCOPED ──────────────────────────────────────────
+
+app.get('/api/stories', (req, res) => {
+  const stories = loadStories(req.userDataDir);
+  res.json({ data: stories, total: stories.length });
+});
+
+app.post('/api/stories', async (req, res) => {
+  const { story, lesson, tags } = req.body;
+  if (!story) return res.status(400).json({ error: 'story is required' });
+  const stories = loadStories(req.userDataDir);
+  const id = generateId();
+  let autoTags = tags || [];
+
+  // Auto-tag via Groq if no tags provided
+  if (autoTags.length === 0 && process.env.GROQ_API_KEY) {
+    try {
+      const tagResult = await callGroq(
+        'Extract 3-5 topic keywords from this story. Return ONLY a JSON array of lowercase strings, no other text.',
+        story + '\n\nLesson: ' + (lesson || ''),
+        { temperature: 0.3, max_tokens: 100 }
+      );
+      const jsonMatch = tagResult.match(/\[[\s\S]*?\]/);
+      if (jsonMatch) autoTags = JSON.parse(jsonMatch[0]);
+    } catch {}
+  }
+
+  const entry = { id, story, lesson: lesson || '', tags: autoTags, added_at: new Date().toISOString() };
+  stories.push(entry);
+  saveStoriesFile(req.userDataDir, stories);
+  res.json({ ok: true, story: entry, total: stories.length });
+});
+
+app.patch('/api/stories/:id', (req, res) => {
+  const stories = loadStories(req.userDataDir);
+  const idx = stories.findIndex(s => s.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'not found' });
+  Object.assign(stories[idx], req.body, { updated_at: new Date().toISOString() });
+  saveStoriesFile(req.userDataDir, stories);
+  res.json({ ok: true, story: stories[idx] });
+});
+
+app.delete('/api/stories/:id', (req, res) => {
+  const stories = loadStories(req.userDataDir);
+  const filtered = stories.filter(s => s.id !== req.params.id);
+  if (filtered.length === stories.length) return res.status(404).json({ error: 'not found' });
+  saveStoriesFile(req.userDataDir, filtered);
+  res.json({ ok: true, remaining: filtered.length });
+});
+
+// ── API: Brief-first flow — TENANT-SCOPED ────────────────────────────────────
+
+app.get('/api/brief/today', (req, res) => {
+  const stateDir = path.join(req.userDataDir, 'state');
+  const briefFile = path.join(stateDir, 'brief_today.json');
+  try {
+    const brief = JSON.parse(fs.readFileSync(briefFile, 'utf8'));
+    const today = new Date().toISOString().slice(0, 10);
+    if (brief.date !== today) return res.json({ brief: null });
+    res.json({ brief });
+  } catch { res.json({ brief: null }); }
+});
+
+app.post('/api/brief', (req, res) => {
+  const { topic, angle, framework, hook_direction, emotion } = req.body;
+  const stateDir = path.join(req.userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const brief = {
+    date: new Date().toISOString().slice(0, 10),
+    topic: topic || '',
+    angle: angle || '',
+    framework: framework || '',
+    hook_direction: hook_direction || '',
+    emotion: emotion || '',
+    status: 'pending',
+    created_at: new Date().toISOString()
+  };
+  fs.writeFileSync(path.join(stateDir, 'brief_today.json'), JSON.stringify(brief, null, 2));
+  notify("Today's brief ready", (topic || 'Brief') + (angle ? ' — ' + angle : ''), '4');
+  res.json({ ok: true, brief });
+});
+
+app.patch('/api/brief', (req, res) => {
+  const stateDir = path.join(req.userDataDir, 'state');
+  const briefFile = path.join(stateDir, 'brief_today.json');
+  try {
+    const brief = JSON.parse(fs.readFileSync(briefFile, 'utf8'));
+    Object.assign(brief, req.body, { status: 'confirmed', updated_at: new Date().toISOString() });
+    fs.writeFileSync(briefFile, JSON.stringify(brief, null, 2));
+    res.json({ ok: true, brief });
+  } catch { res.status(404).json({ error: 'No brief for today' }); }
+});
+
+// Generate 3 alt briefs (for WhatsApp CHANGE command)
+app.post('/api/brief/alternatives', async (req, res) => {
+  const { current_topic } = req.body;
+  const stateDir = path.join(req.userDataDir, 'state');
+  const ctxFile = path.join(req.userDataDir, 'contexts/default.txt');
+  let ctx = '';
+  try { ctx = fs.readFileSync(ctxFile, 'utf8').slice(0, 2000); } catch {}
+
+  try {
+    const result = await callGroq(
+      ctx + '\n\nGenerate 3 alternative content briefs for today. Return ONLY valid JSON array.',
+      'Current topic was: "' + (current_topic || 'none') + '". Generate 3 fresh alternatives.\n' +
+      'Each brief: {"topic":"...","angle":"...","framework":"HIDDEN WINNER|CONTRADICTION|BUILDER ANGLE|TIMELINE LIE|INDIA ANGLE","hook_direction":"one sentence hook direction","emotion":"anger|fear|superiority|hope"}\n' +
+      'Return: [brief1, brief2, brief3]',
+      { temperature: 0.9, max_tokens: 600 }
+    );
+    const jsonMatch = result.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) throw new Error('No JSON');
+    const alts = JSON.parse(jsonMatch[0]);
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'brief_alternatives.json'), JSON.stringify({ alts, at: new Date().toISOString() }, null, 2));
+    res.json({ ok: true, alternatives: alts });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── API: Per-channel trust levels ────────────────────────────────────────────
+
+app.get('/api/trust', (req, res) => {
+  const stateDir = path.join(req.userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(stateDir, 'trust.json'), 'utf8'));
+    res.json(data);
+  } catch {
+    res.json({ trust_level: 0, per_channel_trust: { twitter: 0, linkedin: 0, reels: 0, threads: 0 } });
+  }
+});
+
+app.post('/api/trust', (req, res) => {
+  const { level, channel } = req.body;
+  const lvl = parseInt(level);
+  if (isNaN(lvl) || lvl < 0 || lvl > 2) return res.status(400).json({ error: 'level must be 0, 1, or 2' });
+  const stateDir = path.join(req.userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const trustFile = path.join(stateDir, 'trust.json');
+  let current = {};
+  try { current = JSON.parse(fs.readFileSync(trustFile, 'utf8')); } catch {}
+  if (!current.per_channel_trust) current.per_channel_trust = { twitter: 0, linkedin: 0, reels: 0, threads: 0 };
+
+  if (channel) {
+    current.per_channel_trust[channel] = lvl;
+  } else {
+    current.trust_level = lvl;
+    // Set all channels to the same level when global trust is set
+    for (const ch of Object.keys(current.per_channel_trust)) {
+      current.per_channel_trust[ch] = lvl;
+    }
+  }
+  current.updated_at = new Date().toISOString();
+  fs.writeFileSync(trustFile, JSON.stringify(current, null, 2));
+  const labels = ['Manual approval', '30-min auto-approve', 'Instant publish'];
+  res.json({ ok: true, trust_level: current.trust_level || 0, per_channel_trust: current.per_channel_trust, label: labels[lvl] });
+});
+
+// ── API: Onboarding ───────────────────────────────────────────────────────────
+
+app.get('/api/onboarding/status', (req, res) => {
+  const complete = isOnboardingComplete(req.userDataDir);
+  const stories = loadStories(req.userDataDir);
+  res.json({ complete, story_count: stories.length, needs_stories: stories.length < 5 });
+});
+
+app.post('/api/onboarding', async (req, res) => {
+  const { name, role, building, audience, voice_sliders, real_examples, worldview, unfair_advantage } = req.body;
+  if (!name || !role) return res.status(400).json({ error: 'name and role required' });
+
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_KEY) return res.status(500).json({ error: 'No GROQ_API_KEY' });
+
+  const onboardingData = JSON.stringify(req.body, null, 2);
+  const slopStyleGuide = `
+STYLE RULES:
+- Raw, direct, not corporate
+- No buzzwords: no "leverage", "synergy", "game-changer", "innovative", "passionate"
+- Short sentences. Space with line breaks.
+- Opinion-first, not setup-first
+- Grounded in real stories, not theories
+`;
+
+  try {
+    const contextText = await callGroq(
+      'You generate voice context files for content generation systems. The context file tells the AI who this person is so it can write in their exact voice.',
+      'Generate a comprehensive voice context file for this person:\n\n' + onboardingData +
+      '\n\nCreate a context file with these sections:\n' +
+      '1. IDENTITY: Name, role, what building, unfair advantage\n' +
+      '2. AUDIENCE: Who reads, what they care about, what they should feel after 10 posts\n' +
+      '3. VOICE RULES: Tone, style, what to avoid (based on sliders and preferences)\n' +
+      '4. WORLDVIEW: 5-7 specific contrarian beliefs they hold\n' +
+      '5. BANGER FRAMEWORKS: Which of these fit them: Hidden Winner, Contradiction, Builder Angle, Timeline Lie, India Angle, Money Trail, Real Threat\n' +
+      '6. EXAMPLES OF BANGER TWEETS: Real examples they provided\n' +
+      '7. FORBIDDEN: Phrases and patterns to never use\n\n' +
+      slopStyleGuide,
+      { temperature: 0.7, max_tokens: 2000 }
+    );
+
+    const ctxDir = path.join(req.userDataDir, 'contexts');
+    fs.mkdirSync(ctxDir, { recursive: true });
+    fs.writeFileSync(path.join(ctxDir, 'default.txt'), contextText);
+    fs.writeFileSync(path.join(ctxDir, 'onboarding_raw.json'), JSON.stringify(req.body, null, 2));
+
+    // Seed stories from real examples if provided
+    if (real_examples && Array.isArray(real_examples) && real_examples.length > 0) {
+      const existing = loadStories(req.userDataDir);
+      if (existing.length === 0) {
+        const seedStories = real_examples.slice(0, 5).map((ex, i) => ({
+          id: generateId(),
+          story: typeof ex === 'string' ? ex : (ex.story || ex),
+          lesson: typeof ex === 'object' ? (ex.lesson || '') : '',
+          tags: [],
+          added_at: new Date().toISOString()
+        }));
+        saveStoriesFile(req.userDataDir, seedStories);
+      }
+    }
+
+    res.json({ ok: true, message: 'Voice context generated. Generation is now unlocked.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── API: Regenerate with feedback — TENANT-SCOPED ────────────────────────────
 
 app.post('/api/regenerate/:id', async (req, res) => {
@@ -1098,67 +1528,49 @@ app.post('/api/insight', async (req, res) => {
     }
   } catch {}
 
-  const insightPrompt = (topic ? 'TOPIC: ' + topic : 'Pick a fresh topic from Deep\'s worldview.') +
+  // Use layered prompt builder instead of ad-hoc assembly
+  const layeredContext = buildLayeredPrompt(req.userDataDir, pubDir, decDir, topic, 'twitter');
+
+  const insightPrompt = (topic ? 'TOPIC: ' + topic : 'Pick a fresh topic from the worldview.') +
     (worldview_point ? '\nWORLDVIEW LENS: ' + worldview_point : '') +
-    '\n\nDEEP\'S REAL STORIES (you MUST weave one into the tweet):\n' + storyContext +
     '\n\nGenerate ONE insight that passes the AHA TEST: it connects two things the reader hasn\'t connected before.' +
     '\n\nRules:' +
-    '\n- The tweet MUST include a real story or specific experience, not just an opinion' +
+    '\n- The tweet MUST include a real story or specific experience — stories are in the system prompt' +
     '\n- Target ONE emotion: ANGER (at status quo) or FEAR (being left behind) or SUPERIORITY (reader feels smart) or HOPE (exciting future)' +
-    '\n- The thread must follow this structure: Hook (curiosity gap) → Setup (what everyone thinks) → Twist (what\'s actually true) → Evidence (specific proof) → Implication (what this means for reader) → CTA' +
+    '\n- Declare the emotion BEFORE writing, then write for that emotion' +
+    '\n- Pick ONE framework: Hidden Winner / Contradiction / Builder Angle / Timeline Lie / India Angle' +
+    '\n- The thread: Hook (curiosity gap) → Setup (popular belief) → Twist (what\'s actually true) → Evidence (specific) → Implication → CTA' +
     '\n- NEVER write "X will replace Y" or "X is dead" — find the non-obvious angle' +
-    '\n- Each tweet must be something the reader will SCREENSHOT or QUOTE-TWEET to argue with' +
+    '\n- Each tweet must be something the reader SCREENSHOTS or QUOTE-TWEETS' +
     '\n\nReturn ONLY valid JSON (no markdown, no code fences):' +
-    '\n{"insight":"core idea connecting two things","emotion":"anger/fear/superiority/hope","tweet":"under 280 chars, story-grounded, with line breaks","thread":["hook that creates curiosity gap","what everyone thinks (the setup)","what is actually true (the twist)","specific evidence or story","what this means for YOU the reader","CTA - follow/agree/disagree"],"linkedin_angle":"1 sentence expansion direction","reels_hook":"first 3 seconds that stop the scroll"}' +
+    '\n{"emotion":"anger/fear/superiority/hope","framework":"which framework used","insight":"core idea","tweet":"under 280 chars with line breaks","thread":["hook","setup","twist","evidence","implication","CTA"],"linkedin_angle":"1 sentence expansion","reels_hook":"first 3 seconds that stop the scroll"}' +
     antiRepeat + feedback;
 
   try {
-    const body = JSON.stringify({
-      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
-      messages: [
-        { role: 'system', content: context + '\n\nYou ARE Deep. Generate an insight grounded in real experience. Second-order thinking. Non-obvious. Banger only.' },
-        { role: 'user', content: insightPrompt }
-      ],
-      stream: false, temperature: 0.85, max_tokens: 2000
-    });
+    const insightSys = layeredContext + '\n\nYou generate insights grounded in real experience. Second-order thinking. Non-obvious. Banger only.';
+    const rawInsight = await callGroq(insightSys, insightPrompt, { temperature: 0.88, max_tokens: 2000 });
 
-    const result = await new Promise((resolve, reject) => {
-      const req2 = https.request('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY, 'Content-Length': Buffer.byteLength(body) }
-      }, res2 => { let d = ''; res2.on('data', c => d += c); res2.on('end', () => resolve(d)); });
-      req2.on('error', reject);
-      req2.write(body);
-      req2.end();
-    });
-
-    const parsed = JSON.parse(result);
-    const raw = parsed.choices?.[0]?.message?.content || '{}';
     let insight;
     try {
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      const jsonMatch = rawInsight.match(/\{[\s\S]*\}/);
       if (!jsonMatch) throw new Error('No JSON found');
-      let jsonStr = jsonMatch[0]
-        .replace(/\n\s*\n/g, '\\n')
-        .replace(/,\s*([}\]])/g, '$1');
+      let jsonStr = jsonMatch[0].replace(/,\s*([}\]])/g, '$1');
       insight = JSON.parse(jsonStr);
     } catch (parseErr) {
       try {
-        const tweetMatch = raw.match(/"tweet"\s*:\s*"([^"]+)"/);
-        const insightMatch = raw.match(/"insight"\s*:\s*"([^"]+)"/);
+        const tweetMatch = rawInsight.match(/"tweet"\s*:\s*"([^"]+)"/);
+        const insightMatch = rawInsight.match(/"insight"\s*:\s*"([^"]+)"/);
         if (tweetMatch) {
-          insight = {
-            insight: insightMatch ? insightMatch[1] : '',
-            tweet: tweetMatch[1],
-            thread: [],
-            linkedin_angle: '',
-            reels_hook: ''
-          };
+          insight = { insight: insightMatch ? insightMatch[1] : '', tweet: tweetMatch[1], thread: [], linkedin_angle: '', reels_hook: '' };
         } else throw parseErr;
       } catch {
-        return res.status(500).json({ error: 'Failed to parse insight', raw: raw.slice(0, 300) });
+        return res.status(500).json({ error: 'Failed to parse insight', raw: rawInsight.slice(0, 300) });
       }
     }
+
+    // Quality gate on tweet
+    const tweetGate = qualityGate(insight.tweet || '', 'twitter');
+    if (!tweetGate.pass) console.log('Insight tweet quality issues:', tweetGate.errors);
 
     // Save tweet to pending
     const tweetId = generateId();
@@ -1219,147 +1631,132 @@ app.post('/api/generate', async (req, res) => {
     if (!credit.ok) return res.status(402).json({ error: credit.error });
   }
 
+  if (!process.env.GROQ_API_KEY) return res.status(500).json({ error: 'No GROQ_API_KEY configured' });
+
   const { platform, style, topic } = req.body;
   const targetPlatform = platform || 'twitter';
 
   const pendDir = path.join(req.userDataDir, 'pending');
   const pubDir = path.join(req.userDataDir, 'published');
   const decDir = path.join(req.userDataDir, 'decisions');
-  const ctxFile = path.join(req.userDataDir, 'contexts/default.txt');
-
-  let context = '';
-  try { context = fs.readFileSync(ctxFile, 'utf8'); } catch {}
-
-  let regenLearnings = '';
-  try {
-    if (fs.existsSync(decDir)) {
-      const feedbackItems = fs.readdirSync(decDir)
-        .filter(f => f.startsWith('regen-'))
-        .map(f => { try { return JSON.parse(fs.readFileSync(path.join(decDir, f), 'utf8')); } catch { return null; } })
-        .filter(Boolean)
-        .sort((a, b) => new Date(b.at) - new Date(a.at))
-        .slice(0, 10)
-        .map(d => d.comment);
-      if (feedbackItems.length > 0) {
-        regenLearnings = '\n\nLEARNED PREFERENCES (from past feedback — apply these to ALL content):\n' + feedbackItems.map(f => '- ' + f).join('\n') + '\n';
-      }
-    }
-  } catch {}
-  context += regenLearnings;
-
-  const GROQ_KEY = process.env.GROQ_API_KEY;
-  if (!GROQ_KEY) return res.status(500).json({ error: 'No GROQ_API_KEY configured' });
-
-  const styleInstructions = {
-    contrarian: 'Disagree with something everyone accepts. State the popular view, then destroy it. Be specific about WHY.',
-    raw_take: 'Write a raw, unfiltered thought. 1-3 short lines with blank lines between them. Just conviction.',
-    provocation: 'Say something that will make people angry or think. The kind of tweet people quote-tweet to argue with.',
-    observation: 'Point out a pattern nobody is talking about. 2-3 lines. End with the implication.',
-    hot_take: 'State something unpopular and back it with a reason nobody talks about.',
-    prediction: 'Make a bold prediction about the future. State it as fact. Short. Inevitable tone.',
-    one_liner: 'One sentence under 100 characters. Standalone punch.',
-    question: 'Ask a provocative question that implies a strong opinion. No answer needed.',
-    linkedin: 'Write a 300-500 word LinkedIn post. Hook in first 2 lines. Structured. Professional but opinionated. End with CTA.',
-    reels: 'Create a 30-60s Reels script. Return JSON: {"hook":"...","beats":[{"voiceover":"...","visual":"...","duration":"Xs"}],"cta":"...","music_mood":"...","total_duration":"Xs"}'
-  };
 
   const chosenStyle = style || 'contrarian';
   const isLinkedIn = targetPlatform === 'linkedin' || chosenStyle === 'linkedin';
   const isReels = targetPlatform === 'reels' || chosenStyle === 'reels';
+  const actualPlatform = isReels ? 'reels' : (isLinkedIn ? 'linkedin' : 'twitter');
 
-  let userPrompt = '';
-  if (isReels) {
-    userPrompt = (topic ? 'Topic: ' + topic + '\\n\\n' : '') + styleInstructions.reels;
-  } else if (isLinkedIn) {
-    userPrompt = (topic ? 'Topic: ' + topic + '\\n\\n' : '') + styleInstructions.linkedin + '\\n\\nReturn ONLY the post text.';
-  } else {
-    var recentApproved = [];
+  // Check for today's brief as topic hint
+  let briefTopic = topic;
+  if (!briefTopic) {
     try {
-      recentApproved = readJsonDir(pubDir)
-        .filter(function(p) { return p.platform === 'twitter'; })
-        .slice(0, 15)
-        .map(function(p) { return p.content; });
-    } catch(e) {}
-
-    var antiRepeat = recentApproved.length > 0
-      ? '\\n\\nNEVER repeat these ideas (already posted):\\n' + recentApproved.map(function(t, i) { return (i+1) + '. ' + t.slice(0, 80); }).join('\\n') + '\\n\\nFind something COMPLETELY DIFFERENT.'
-      : '';
-
-    userPrompt = (topic ? 'SPECIFIC ANGLE: ' + topic + '.' : 'Pick a topic from Deep\'s identity that hasn\'t been covered recently.') +
-      '\\n\\nStyle: ' + (styleInstructions[chosenStyle] || styleInstructions.contrarian) +
-      '\\n\\nFRAMEWORK (use one):\\n' +
-      '- HIDDEN WINNER: Who benefits that nobody talks about?\\n' +
-      '- CONTRADICTION: What does conventional wisdom get wrong here?\\n' +
-      '- BUILDER ANGLE: What would you build on top of this?\\n' +
-      '- TIMELINE LIE: Is this faster/slower than people think?\\n' +
-      '- INDIA ANGLE: How is this different in India?\\n\\n' +
-      'Rules:\\n' +
-      '- Under 280 chars. Space out with line breaks.\\n' +
-      '- MUST include a real story or specific experience. Never just an opinion.\\n' +
-      '- Target ONE emotion: anger/fear/superiority/hope.\\n' +
-      '- The AHA test: connect two things the reader has not connected before.\\n' +
-      '- NEVER write "X will replace Y" or "X is dead."\\n' +
-      '- Study the BANGER EXAMPLES in the system prompt. Match that level.\\n' +
-      'Return ONLY the tweet text.' + antiRepeat;
+      const stateDir = path.join(req.userDataDir, 'state');
+      const briefFile = path.join(stateDir, 'brief_today.json');
+      const brief = JSON.parse(fs.readFileSync(briefFile, 'utf8'));
+      const today = new Date().toISOString().slice(0, 10);
+      if (brief.date === today && brief.topic) briefTopic = brief.topic;
+    } catch {}
   }
 
-  const sysPrompt = context + (isLinkedIn
-    ? '\\n\\nYou are writing a LinkedIn post as Deep. Professional but opinionated. Target: Indian business audience.'
-    : '\\n\\nYou ARE Deep. Match the real tweets above exactly. Raw, short, controversial.');
+  // Build layered system prompt
+  const sysPrompt = buildLayeredPrompt(req.userDataDir, pubDir, decDir, briefTopic, actualPlatform) +
+    (isLinkedIn ? '\n\nYou are writing a LinkedIn post. Professional but opinionated. Hook in first 2 lines above the fold. No bullshit.' :
+     isReels ? '\n\nYou are writing a Reels script. Hook must be under 8 words. Each beat punchy.' :
+     '\n\nYou ARE this person. Raw, short, no corporate speak. Match the examples.');
 
+  const styleInstructions = {
+    contrarian: 'Disagree with something everyone accepts. State the popular view, then destroy it with specifics.',
+    raw_take: 'Write a raw, unfiltered thought. 1-3 short lines with line breaks. Just conviction.',
+    provocation: 'Say something that makes people quote-tweet to argue. Provocative, not mean.',
+    observation: 'Point out a pattern nobody talks about. 2-3 lines. End with the implication.',
+    hot_take: 'Unpopular opinion backed by a reason nobody discusses.',
+    prediction: 'Bold prediction stated as fact. Short. Inevitable tone.',
+    one_liner: 'One sentence, under 100 characters. Standalone punch.',
+    question: 'Provocative question that implies a strong opinion. No answer needed.',
+    linkedin: 'LinkedIn post. Hook in first 2 lines. 300-500 words. Professional but opinionated. End with CTA or question.',
+    reels: 'Return JSON: {"hook":"under 8 words","beats":[{"voiceover":"...","visual":"...","duration":"Xs"}],"cta":"...","music_mood":"...","total_duration":"Xs"}'
+  };
+
+  // HOOK-FIRST approach for Twitter: generate hook, then build post around it
+  let finalContent = '';
   try {
-    const body = JSON.stringify({
-      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
-      messages: [{ role: 'system', content: sysPrompt }, { role: 'user', content: userPrompt }],
-      stream: false,
-      temperature: isLinkedIn ? 0.7 : 0.85
-    });
+    if (actualPlatform === 'twitter') {
+      // Step 1: Generate hook
+      const emotion = ['anger', 'fear', 'superiority', 'hope'][Math.floor(Math.random() * 4)];
+      const frameworks = ['HIDDEN WINNER: Who benefits that nobody talks about?',
+        'CONTRADICTION: What does conventional wisdom get wrong?',
+        'BUILDER ANGLE: What would you build on top of this?',
+        'TIMELINE LIE: Is this happening faster/slower than people think?',
+        'INDIA ANGLE: How does this play out differently in India?'];
+      const framework = frameworks[Math.floor(Math.random() * frameworks.length)];
 
-    const result = await new Promise((resolve, reject) => {
-      const req2 = https.request('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY, 'Content-Length': Buffer.byteLength(body) }
-      }, res2 => { let d = ''; res2.on('data', c => d += c); res2.on('end', () => resolve(d)); });
-      req2.on('error', reject);
-      req2.write(body);
-      req2.end();
-    });
+      const hookPrompt = (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') +
+        'Target emotion: ' + emotion + '\n' +
+        'Framework to use: ' + framework + '\n\n' +
+        'Style: ' + (styleInstructions[chosenStyle] || styleInstructions.contrarian) + '\n\n' +
+        'Write ONLY the first line (the hook). It must:\n' +
+        '- Stop the scroll immediately\n' +
+        '- State the result, pain point, or controversial take directly\n' +
+        '- NOT start with "I\'ve been thinking", "Today I want to", or any setup\n' +
+        '- Be under 60 characters if possible\n' +
+        'Return ONLY the hook text, nothing else.';
 
-    const parsed = JSON.parse(result);
-    let content = parsed.choices?.[0]?.message?.content || '';
+      const hook = await callGroq(sysPrompt, hookPrompt, { temperature: 0.9, max_tokens: 80 });
 
-    if (isReels) {
+      // Step 2: Build full tweet around the hook
+      let genAttempts = 0;
+      while (genAttempts < 2) {
+        const fullPrompt = 'Hook (first line — DO NOT change this): "' + hook.trim() + '"\n\n' +
+          'Now write the complete tweet STARTING with that exact hook.\n' +
+          'Style: ' + (styleInstructions[chosenStyle] || styleInstructions.contrarian) + '\n' +
+          'Rules:\n- Under 280 chars total\n- Line breaks between ideas\n- No emojis, no hashtags\n' +
+          '- Weave in a real story or specific experience\n- End with the implication or provocation\n' +
+          'Return ONLY the tweet text.';
+
+        finalContent = await callGroq(sysPrompt, fullPrompt, { temperature: 0.8, max_tokens: 200 });
+        const gate = qualityGate(finalContent, 'twitter');
+        if (gate.pass || genAttempts === 1) break;
+        genAttempts++;
+      }
+
+    } else if (isLinkedIn) {
+      const liPrompt = (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') +
+        styleInstructions.linkedin + '\n\n' +
+        'Rules:\n- Hook MUST be in first 2 lines (above the fold)\n- Line break after hook\n' +
+        '- 300-500 words\n- End with a question or CTA\n- No "I\'m thrilled to share" openers\n' +
+        'Return ONLY the post text.';
+      finalContent = await callGroq(sysPrompt, liPrompt, { temperature: 0.72, max_tokens: 700 });
+
+    } else if (isReels) {
+      const reelsPrompt = (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') + styleInstructions.reels;
+      const raw = await callGroq(sysPrompt, reelsPrompt, { temperature: 0.8, max_tokens: 600 });
       try {
-        const script = JSON.parse(content.replace(/```json|```/g, '').trim());
-        content = 'HOOK: ' + (script.hook || '') + '\\n\\n' +
-          (script.beats || []).map((b, i) => 'BEAT ' + (i+1) + ' (' + (b.duration || '?') + '):\\n' + (b.voiceover || '') + '\\nVISUAL: ' + (b.visual || '')).join('\\n\\n') +
-          '\\n\\nCTA: ' + (script.cta || '') + '\\nMOOD: ' + (script.music_mood || 'energetic');
-      } catch {}
+        const script = JSON.parse(raw.replace(/```json|```/g, '').trim());
+        finalContent = 'HOOK: ' + (script.hook || '') + '\n\n' +
+          (script.beats || []).map((b, i) => 'BEAT ' + (i+1) + ' (' + (b.duration || '?') + '):\n' + (b.voiceover || '') + '\nVISUAL: ' + (b.visual || '')).join('\n\n') +
+          '\n\nCTA: ' + (script.cta || '') + '\nMOOD: ' + (script.music_mood || 'energetic');
+      } catch { finalContent = raw; }
     }
-
-    const actualPlatform = isReels ? 'reels' : (isLinkedIn ? 'linkedin' : 'twitter');
-
-    const id = generateId();
-    const post = {
-      id,
-      profile_id: 'deep_personal',
-      display_name: 'Deep – Personal',
-      platform: actualPlatform,
-      content,
-      content_full: { tweet: content },
-      pillar: topic || 'On Demand',
-      format: isReels ? 'reels_script' : (isLinkedIn ? 'linkedin_post' : chosenStyle),
-      created_at: new Date().toISOString(),
-      status: 'pending'
-    };
-    fs.writeFileSync(path.join(pendDir, `${id}.json`), JSON.stringify(post, null, 2));
-
-    notify('New content generated', actualPlatform + ' post ready for review');
-
-    res.json({ ok: true, id, content, platform: actualPlatform, style: chosenStyle });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: e.message });
   }
+
+  const id = generateId();
+  const post = {
+    id,
+    profile_id: 'deep_personal',
+    display_name: 'Deep – Personal',
+    platform: actualPlatform,
+    content: finalContent,
+    content_full: { tweet: finalContent },
+    pillar: briefTopic || 'On Demand',
+    format: isReels ? 'reels_script' : (isLinkedIn ? 'linkedin_post' : chosenStyle),
+    created_at: new Date().toISOString(),
+    status: 'pending'
+  };
+  fs.writeFileSync(path.join(pendDir, `${id}.json`), JSON.stringify(post, null, 2));
+
+  notify('New content generated', actualPlatform + ' post ready for review');
+  res.json({ ok: true, id, content: finalContent, platform: actualPlatform, style: chosenStyle });
 });
 
 // ── API: Article Scout — TENANT-SCOPED ───────────────────────────────────────
@@ -1462,31 +1859,29 @@ app.post('/api/scout', async (req, res) => {
     : '';
 
   const takePrompt = 'Here are today\'s news articles:\n\n' + articleSummaries + '\n\n' +
-    'Deep has 10 specific worldview points (see system prompt under "DEEP\'S SPECIFIC WORLDVIEW"). ' +
-    'For each article, filter it through ONE of those worldview points to create the take.\n\n' +
-    'For each article:\n' +
-    '1. Score 1-10 for relevance to Deep\'s audience (US tech Twitter, AI builders, founders, Indian tech leaders)\n' +
-    '2. Generate 2 BANGER takes. Not surface-level commentary. Use ONE of these frameworks per take:\n\n' +
-    'FRAMEWORKS (pick the most interesting one for each take):\n' +
-    '- HIDDEN WINNER: Who benefits from this that nobody is talking about?\n' +
-    '- REAL THREAT: What is the actual danger the headline misses?\n' +
-    '- CONTRADICTION: What does this article accidentally prove wrong about conventional wisdom?\n' +
-    '- TIMELINE LIE: Is this happening faster or slower than people think? Why?\n' +
-    '- MONEY TRAIL: Who is paying for this and what does that reveal?\n' +
-    '- BUILDER ANGLE: If you were building a product on top of this news, what would you build?\n' +
-    '- INDIA ANGLE: How does this play out completely differently in India vs the US?\n\n' +
-    'Rules:\n' +
-    '- Each take under 280 chars\n' +
-    '- No emojis, no hashtags\n' +
-    '- Spaced out with line breaks between sentences\n' +
-    '- Must pass the AHA TEST: connect two things the reader hasn\'t connected before\n' +
-    '- MUST weave in a specific story or experience, not just an opinion\n' +
-    '- Target an emotion: anger at status quo, fear of being left behind, superiority for knowing this, or hope for the future\n' +
-    '- NEVER write "X will replace Y" or "X is dead" — find the HIDDEN angle\n' +
-    '- Be specific. Name companies, name numbers, name consequences.\n' +
+    'For each article, apply 4 quality filters and generate 2 banger takes.\n\n' +
+    '4 FILTERS (score each 1-10):\n' +
+    '1. RELEVANCE: Is this in my domain? (AI, tech, startups, India tech, automation)\n' +
+    '2. AUDIENCE FIT: Would US tech Twitter / Indian founders / AI builders actually care?\n' +
+    '3. CREDIBILITY: Do I have standing to comment from my background/experience?\n' +
+    '4. NOVELTY: Has this exact angle been covered in the last 30 days? (novelty = fresh angle)\n' +
+    'Average score must be 6+ to include the article.\n\n' +
+    'FRAMEWORKS (use one per take):\n' +
+    '- HIDDEN WINNER: Who benefits that nobody is talking about?\n' +
+    '- REAL THREAT: What danger does the headline miss?\n' +
+    '- CONTRADICTION: What does this accidentally prove wrong?\n' +
+    '- TIMELINE LIE: Is this faster/slower than people think?\n' +
+    '- MONEY TRAIL: Who is paying for this and what does it reveal?\n' +
+    '- BUILDER ANGLE: What product would you build on top of this?\n' +
+    '- INDIA ANGLE: How does this play out differently in India?\n\n' +
+    'Rules for takes:\n' +
+    '- Under 280 chars. No emojis, no hashtags. Line breaks between sentences.\n' +
+    '- AHA TEST: connect two things the reader hasn\'t connected before\n' +
+    '- Be specific. Name companies, numbers, consequences.\n' +
+    '- NEVER "X will replace Y" or "X is dead"\n' +
     avoidList +
-    '\nReturn ONLY valid JSON:\n{"articles":[{"index":1,"score":8,"takes":["take1","take2"]},...]}\n' +
-    'Only include articles scoring 6 or above.';
+    '\nReturn ONLY valid JSON:\n{"articles":[{"index":1,"score_breakdown":{"relevance":8,"audience_fit":7,"credibility":6,"novelty":9,"avg":7.5},"takes":["take1","take2"]},...]}\n' +
+    'Omit articles where avg score < 6.';
 
   try {
     const body = JSON.stringify({
@@ -1527,13 +1922,15 @@ app.post('/api/scout', async (req, res) => {
       if (idx < 0 || idx >= allArticles.length) continue;
       const article = allArticles[idx];
       const id = generateId();
+      const scoreBreakdown = item.score_breakdown || {};
       const articleData = {
         id,
         title: article.title || '',
         url: article.url || '',
         source: article.engine || article.parsed_url?.[1] || 'unknown',
         summary: (article.content || article.description || '').slice(0, 300),
-        score: item.score,
+        score: scoreBreakdown.avg || item.score || 0,
+        score_breakdown: scoreBreakdown,
         takes: item.takes || [],
         scouted_at: new Date().toISOString(),
         status: 'new'
@@ -2014,6 +2411,181 @@ ${post.content_full && Object.keys(post.content_full).length > 1 ? `
   res.type('html').send(html);
 });
 
+// ── Onboarding wizard ────────────────────────────────────────────────────────
+
+app.get('/onboarding', (req, res) => {
+  const complete = isOnboardingComplete(req.userDataDir);
+  const stories = loadStories(req.userDataDir);
+  res.type('html').send(`<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Voice DNA Setup — Content Machine</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#e0e0e0;padding:20px;max-width:680px;margin:0 auto}
+h1{font-size:22px;margin-bottom:4px;color:#4ade80}
+.sub{color:#888;font-size:13px;margin-bottom:24px}
+.step{display:none;animation:fadein .3s}
+.step.active{display:block}
+@keyframes fadein{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.step-num{font-size:11px;color:#4ade80;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+h2{font-size:16px;margin-bottom:4px}
+.hint{font-size:12px;color:#666;margin-bottom:12px}
+label{font-size:12px;color:#888;display:block;margin-bottom:3px;margin-top:10px}
+input,textarea{width:100%;padding:10px;background:#161616;border:1px solid #333;color:#e0e0e0;border-radius:6px;font-size:13px;font-family:inherit;resize:vertical}
+textarea{min-height:80px}
+.slider-row{display:flex;align-items:center;gap:10px;margin:8px 0}
+.slider-row label{margin:0;min-width:120px;font-size:12px;color:#aaa}
+.slider-row span{font-size:11px;color:#666;min-width:70px}
+input[type=range]{flex:1}
+.btns{display:flex;gap:8px;margin-top:16px}
+button{padding:10px 20px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:600}
+.btn-next{background:#4ade80;color:#000}.btn-next:hover{background:#22c55e}
+.btn-back{background:#1e293b;color:#e0e0e0}.btn-back:hover{background:#334155}
+.btn-submit{background:#4ade80;color:#000}.btn-submit:hover{background:#22c55e}
+.progress{display:flex;gap:4px;margin-bottom:20px}
+.dot{width:8px;height:8px;border-radius:50%;background:#333}
+.dot.done{background:#4ade80}
+.dot.active{background:#22c55e;box-shadow:0 0 6px #4ade80}
+.stories-list{margin-top:8px}
+.story-item{background:#161616;border:1px solid #333;border-radius:6px;padding:8px 10px;margin-bottom:6px;font-size:12px;display:flex;justify-content:space-between}
+.story-item button{background:#7f1d1d;color:#f87171;border:none;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:10px}
+.complete-banner{background:#166534;border:1px solid #4ade80;border-radius:8px;padding:16px;margin-bottom:16px;font-size:14px}
+.add-story-row{display:flex;gap:8px;margin-top:8px}
+.add-story-row input{flex:1}
+.add-story-row button{background:#1e293b;color:#4ade80;border:1px solid #333;border-radius:6px;padding:8px 14px;cursor:pointer;font-size:12px;white-space:nowrap}
+</style></head><body>
+<h1>Voice DNA Setup</h1>
+<p class="sub">7-step interview to generate your content voice. Takes ~5 minutes.</p>
+${complete ? '<div class="complete-banner">✓ Voice DNA already set up. <a href="/dashboard" style="color:#4ade80">Back to dashboard</a> or redo below to regenerate.</div>' : ''}
+<div class="progress" id="progress">${[0,1,2,3,4,5,6].map((i) => '<div class="dot' + (i===0?' active':'') + '" id="dot'+i+'"></div>').join('')}</div>
+
+<form id="onboardingForm">
+<div class="step active" id="step0">
+  <div class="step-num">Step 1 of 7 — Identity</div>
+  <h2>Who are you?</h2>
+  <p class="hint">This becomes the core of your AI voice. Be specific.</p>
+  <label>Your name</label><input name="name" value="${escapeHtml(req.user?.name || '')}" required>
+  <label>Your role / what you do</label><input name="role" placeholder="e.g. Founder building AI tools for Indian SMEs" required>
+  <label>What are you building right now?</label><input name="building" placeholder="e.g. Intrkt — WhatsApp automation for sales teams">
+  <label>Your unfair advantage (what you know that others don't)</label><textarea name="unfair_advantage" placeholder="e.g. I've run support for 50+ B2B companies and see where automation breaks..."></textarea>
+  <div class="btns"><button type="button" class="btn-next" onclick="nextStep(0)">Next →</button></div>
+</div>
+
+<div class="step" id="step1">
+  <div class="step-num">Step 2 of 7 — Audience</div>
+  <h2>Who reads your content?</h2>
+  <label>Who is your primary audience?</label><input name="audience" placeholder="e.g. Indian founders, US tech Twitter, AI builders in SE Asia">
+  <label>What problem do they have that you understand deeply?</label><textarea name="audience_problem" placeholder="They're trying to automate but don't know where to start..."></textarea>
+  <label>What should they think / feel after 10 of your posts?</label><textarea name="audience_outcome" placeholder="That AI automation is simpler than they think and they should start now"></textarea>
+  <div class="btns"><button type="button" class="btn-back" onclick="prevStep(1)">← Back</button><button type="button" class="btn-next" onclick="nextStep(1)">Next →</button></div>
+</div>
+
+<div class="step" id="step2">
+  <div class="step-num">Step 3 of 7 — Voice</div>
+  <h2>What's your tone?</h2>
+  <p class="hint">Drag sliders to define your voice spectrum.</p>
+  ${[
+    ['controversial','safe','voice_controversial'],
+    ['raw','polished','voice_raw'],
+    ['short-form','long-form','voice_shortform'],
+    ['opinionated','balanced','voice_opinionated'],
+    ['personal','professional','voice_personal']
+  ].map(([l,r,name]) => `<div class="slider-row"><span>${l}</span><input type="range" min="1" max="10" value="5" name="${name}"><span>${r}</span></div>`).join('')}
+  <label>Topics or styles you HATE seeing in content</label><textarea name="voice_hate" placeholder="Generic AI takes, 'disruption' language, humble-brags, corporate speak..."></textarea>
+  <div class="btns"><button type="button" class="btn-back" onclick="prevStep(2)">← Back</button><button type="button" class="btn-next" onclick="nextStep(2)">Next →</button></div>
+</div>
+
+<div class="step" id="step3">
+  <div class="step-num">Step 4 of 7 — Real Examples</div>
+  <h2>Paste 5+ real posts you've written</h2>
+  <p class="hint">These become ground truth. The AI will study your actual writing, not a description of it.</p>
+  <textarea name="real_examples_raw" style="min-height:200px" placeholder="Paste your real tweets/posts here. Separate each post with a blank line.&#10;&#10;The more you give, the better the voice match."></textarea>
+  <div class="btns"><button type="button" class="btn-back" onclick="prevStep(3)">← Back</button><button type="button" class="btn-next" onclick="nextStep(3)">Next →</button></div>
+</div>
+
+<div class="step" id="step4">
+  <div class="step-num">Step 5 of 7 — Worldview</div>
+  <h2>What do you believe that most people don't?</h2>
+  <p class="hint">Write 3-5 specific contrarian beliefs you'd defend at dinner. Not "AI is important" — specifics.</p>
+  <textarea name="worldview" style="min-height:120px" placeholder="1. Most Indian startups fail at automation because they outsource it too early.&#10;2. WhatsApp is more powerful than email for B2B in India.&#10;3. The best AI products are boring-looking but extremely reliable."></textarea>
+  <div class="btns"><button type="button" class="btn-back" onclick="prevStep(4)">← Back</button><button type="button" class="btn-next" onclick="nextStep(4)">Next →</button></div>
+</div>
+
+<div class="step" id="step5">
+  <div class="step-num">Step 6 of 7 — Story Bank</div>
+  <h2>Add your real stories (min 3)</h2>
+  <p class="hint">Stories ground your content in real experience. Add at least 3 to unlock the quality engine.</p>
+  <div id="storiesList" class="stories-list">${stories.map(s => `<div class="story-item"><span>${escapeHtml((s.story||'').slice(0,80))}</span><button type="button" onclick="deleteStory('${s.id}')">✕</button></div>`).join('')}</div>
+  <label>Story</label><textarea id="newStoryText" placeholder="What happened? Be specific — time, place, what you observed, what you did..."></textarea>
+  <label>Lesson / punchline</label><input id="newStoryLesson" placeholder="What does this prove or teach?">
+  <div class="add-story-row"><button type="button" onclick="addStory()">+ Add Story</button></div>
+  <div id="storyStatus" style="font-size:12px;color:#4ade80;margin-top:6px"></div>
+  <div class="btns" style="margin-top:16px"><button type="button" class="btn-back" onclick="prevStep(5)">← Back</button><button type="button" class="btn-next" onclick="nextStep(5)">Next →</button></div>
+</div>
+
+<div class="step" id="step6">
+  <div class="step-num">Step 7 of 7 — Activate</div>
+  <h2>Generate your Voice DNA</h2>
+  <p class="hint">This will synthesize everything into a context file that guides all future content generation.</p>
+  <div id="submitStatus" style="font-size:13px;color:#facc15;margin-bottom:12px"></div>
+  <div class="btns"><button type="button" class="btn-back" onclick="prevStep(6)">← Back</button><button type="button" class="btn-submit" onclick="submitOnboarding()">Generate Voice DNA →</button></div>
+</div>
+</form>
+
+<script>
+var currentStep = 0;
+var storyCount = ${stories.length};
+function setStep(n){
+  document.querySelectorAll('.step').forEach(function(s,i){s.classList.toggle('active',i===n)});
+  document.querySelectorAll('.dot').forEach(function(d,i){
+    d.className='dot'+(i<n?' done':(i===n?' active':''));
+  });
+  currentStep=n;
+}
+function nextStep(n){setStep(n+1)}
+function prevStep(n){setStep(n-1)}
+function addStory(){
+  var st=document.getElementById('newStoryText').value.trim();
+  var le=document.getElementById('newStoryLesson').value.trim();
+  if(!st){document.getElementById('storyStatus').textContent='Write a story first.';return}
+  document.getElementById('storyStatus').textContent='Adding...';
+  fetch('/api/stories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({story:st,lesson:le})})
+    .then(function(r){return r.json()}).then(function(d){
+      if(d.ok){
+        storyCount++;
+        document.getElementById('storiesList').innerHTML+='<div class="story-item"><span>'+st.slice(0,80)+'</span><button type="button" onclick="deleteStory(\''+d.story.id+'\')">✕</button></div>';
+        document.getElementById('newStoryText').value='';
+        document.getElementById('newStoryLesson').value='';
+        document.getElementById('storyStatus').textContent='Story '+storyCount+' added! ('+d.total+' total)';
+      }
+    }).catch(function(){document.getElementById('storyStatus').textContent='Failed to add story.'});
+}
+function deleteStory(id){
+  fetch('/api/stories/'+id,{method:'DELETE'}).then(function(){location.reload()})
+}
+function submitOnboarding(){
+  var status=document.getElementById('submitStatus');
+  status.textContent='Generating your Voice DNA via Groq... (takes 10-20s)';
+  var form=document.getElementById('onboardingForm');
+  var data={};
+  new FormData(form).forEach(function(v,k){data[k]=v});
+  // Parse raw examples into array
+  if(data.real_examples_raw){
+    data.real_examples=data.real_examples_raw.split(/\\n\\n+/).map(function(s){return s.trim()}).filter(Boolean);
+  }
+  // Parse worldview into array
+  if(data.worldview){
+    data.worldview=data.worldview.split('\\n').map(function(s){return s.replace(/^\\d+\\.\\s*/,'').trim()}).filter(Boolean);
+  }
+  fetch('/api/onboarding',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+    .then(function(r){return r.json()}).then(function(d){
+      if(d.ok){status.textContent='Done! Voice DNA generated.';setTimeout(function(){location.href='/dashboard'},1500)}
+      else{status.textContent='Error: '+(d.error||'unknown')}
+    }).catch(function(e){status.textContent='Error: '+e.message});
+}
+</script></body></html>`);
+});
+
 // ── Dashboard — TENANT-SCOPED ────────────────────────────────────────────────
 
 app.get('/dashboard', (req, res) => {
@@ -2046,18 +2618,38 @@ app.get('/dashboard', (req, res) => {
       .slice(0, 5);
   } catch {}
 
+  // Load today's brief
+  let todayBrief = null;
+  try {
+    const briefData = JSON.parse(fs.readFileSync(path.join(req.userDataDir, 'state/brief_today.json'), 'utf8'));
+    if (briefData.date === new Date().toISOString().slice(0, 10)) todayBrief = briefData;
+  } catch {}
+
+  // Load stories for stories tab
+  const userStories = loadStories(req.userDataDir);
+
+  // Load trust settings
+  let trustSettings = { trust_level: 0, per_channel_trust: { twitter: 0, linkedin: 0, reels: 0, threads: 0 } };
+  try {
+    trustSettings = JSON.parse(fs.readFileSync(path.join(req.userDataDir, 'state/trust.json'), 'utf8'));
+    if (!trustSettings.per_channel_trust) trustSettings.per_channel_trust = { twitter: 0, linkedin: 0, reels: 0, threads: 0 };
+  } catch {}
+
+  const onboardingDone = isOnboardingComplete(req.userDataDir);
+
   const counts = {
     feed: articles.length,
     twitter: allPending.filter(p => p.platform === 'twitter').length + allPosts.filter(p => p.platform === 'twitter').length,
     linkedin: allPending.filter(p => p.platform === 'linkedin').length + allPosts.filter(p => p.platform === 'linkedin').length,
     reels: allPending.filter(p => p.platform === 'reels').length + allPosts.filter(p => p.platform === 'reels').length,
-    approved: allPosts.length
+    approved: allPosts.length,
+    stories: userStories.length
   };
   const pendingCount = allPending.length;
 
   let tabPending = [], tabApproved = [];
-  if (tab === 'feed') {
-    // Feed tab shows articles
+  if (tab === 'feed' || tab === 'stories' || tab === 'settings') {
+    // These tabs don't use tabPending/tabApproved
   } else if (tab === 'approved') {
     tabApproved = allPosts.slice(0, 20);
   } else {
@@ -2147,10 +2739,24 @@ app.get('/dashboard', (req, res) => {
         + '</div>';
     }).join('');
 
+    var scoreHtml = '';
+    var bd = a.score_breakdown;
+    if (bd && bd.relevance) {
+      scoreHtml = '<div class="score-breakdown">'
+        + '<span>R:' + bd.relevance + '</span>'
+        + '<span>A:' + bd.audience_fit + '</span>'
+        + '<span>C:' + bd.credibility + '</span>'
+        + '<span>N:' + bd.novelty + '</span>'
+        + '<span class="score-avg">avg ' + (bd.avg || a.score) + '</span>'
+        + '</div>';
+    } else {
+      scoreHtml = '<span class="tag tag-format">score ' + (a.score || '?') + '</span>';
+    }
+
     return '<div class="article-card">'
       + '<div class="article-header">'
       + '<a href="' + esc(a.url) + '" target="_blank" class="article-title">' + esc(a.title) + '</a>'
-      + '<div class="article-meta"><span class="tag">' + esc(a.source) + '</span><span class="tag tag-format">score ' + a.score + '</span></div>'
+      + '<div class="article-meta"><span class="tag">' + esc(a.source) + '</span>' + scoreHtml + '</div>'
       + '</div>'
       + '<div class="article-summary">' + esc((a.summary || '').slice(0, 150)) + '</div>'
       + '<div class="article-takes">' + takesHtml + '</div>'
@@ -2161,16 +2767,48 @@ app.get('/dashboard', (req, res) => {
       + '</div></div>';
   }
 
+  // Brief section HTML
+  var briefSection = '';
+  if (todayBrief) {
+    briefSection = '<div class="section brief-section" style="border-color:#7c3aed;margin-bottom:12px">'
+      + '<div class="section-header"><h2 style="color:#a78bfa">Today\'s Brief</h2>'
+      + '<div style="font-size:10px;color:' + (todayBrief.status === 'confirmed' ? '#4ade80' : '#facc15') + '">'
+      + (todayBrief.status === 'confirmed' ? 'Confirmed' : 'Pending') + '</div></div>'
+      + '<div style="font-size:12px;line-height:1.6;margin-bottom:8px">'
+      + '<b style="color:#c4b5fd">Topic:</b> ' + esc(todayBrief.topic || '') + '<br>'
+      + '<b style="color:#c4b5fd">Angle:</b> ' + esc(todayBrief.angle || '') + '<br>'
+      + '<b style="color:#c4b5fd">Framework:</b> ' + esc(todayBrief.framework || '') + '<br>'
+      + '<b style="color:#c4b5fd">Hook direction:</b> ' + esc(todayBrief.hook_direction || '') + '<br>'
+      + '<b style="color:#c4b5fd">Emotion:</b> ' + esc(todayBrief.emotion || '')
+      + '</div>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap">'
+      + '<button class="btn" style="background:#166534;color:#4ade80" onclick="confirmBrief()">Looks good →</button>'
+      + '<button class="btn" style="background:#1e293b;color:#c4b5fd" onclick="changeBrief()">Change it</button>'
+      + '<button class="btn btn-edit" onclick="editBriefToggle()">Edit brief</button>'
+      + '</div>'
+      + '<div id="briefEdit" style="display:none;margin-top:8px">'
+      + '<input class="gen-input" id="briefTopic" value="' + esc(todayBrief.topic || '') + '" placeholder="Topic" style="margin-bottom:4px"><br>'
+      + '<input class="gen-input" id="briefAngle" value="' + esc(todayBrief.angle || '') + '" placeholder="Angle" style="margin-bottom:4px"><br>'
+      + '<input class="gen-input" id="briefHook" value="' + esc(todayBrief.hook_direction || '') + '" placeholder="Hook direction" style="margin-bottom:4px"><br>'
+      + '<button class="btn btn-approve" onclick="saveBriefEdit()">Save</button>'
+      + '</div>'
+      + '<div id="briefStatus" style="font-size:11px;color:#facc15;margin-top:5px"></div>'
+      + '</div>';
+  } else if (!onboardingDone) {
+    briefSection = '<div class="section" style="border-color:#facc15;margin-bottom:12px"><div style="font-size:13px">⚠️ Voice DNA not set up. <a href="/onboarding" style="color:#facc15">Complete onboarding</a> to unlock content quality features.</div></div>';
+  }
+
   let tabContent = '';
   if (tab === 'feed') {
-    tabContent = '<div class="section" style="border-color:#334155;margin-bottom:12px">'
+    tabContent = briefSection
+      + '<div class="section" style="border-color:#334155;margin-bottom:12px">'
       + '<div class="section-header"><h2>Generate Insight</h2></div>'
       + '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px">'
       + '<input type="text" id="insightTopic" placeholder="Topic (optional)..." class="gen-input-sm" style="flex:2" />'
       + '<button class="gen-style" onclick="genInsight()">Generate Insight</button>'
       + '</div>'
       + '<div class="gen-status" id="insightStatus"></div>'
-      + '<div style="font-size:10px;color:#555;margin-bottom:4px">Generates: tweet + thread + LinkedIn draft + Reels hook — all from one insight</div>'
+      + '<div style="font-size:10px;color:#555;margin-bottom:4px">Generates: tweet + thread + LinkedIn draft + Reels hook</div>'
       + '</div>'
       + '<div class="section" style="border-color:#7c2d12">'
       + '<div class="section-header"><h2>Article Feed</h2><button class="btn btn-edit" onclick="runScout()" id="scoutBtn">Scan Now</button></div>'
@@ -2235,6 +2873,59 @@ app.get('/dashboard', (req, res) => {
     }
   }
 
+  // Stories tab
+  if (tab === 'stories') {
+    tabContent = '<div class="section" style="border-color:#7c3aed">'
+      + '<div class="section-header"><h2 style="color:#a78bfa">Story Bank</h2><span style="font-size:11px;color:#888">' + userStories.length + ' stories</span></div>'
+      + (userStories.length < 5 ? '<div style="font-size:11px;color:#facc15;margin-bottom:8px">Add ' + (5 - userStories.length) + ' more stories to reach the quality threshold (5 minimum).</div>' : '')
+      + userStories.map(function(s) {
+          return '<div class="story-card">'
+            + '<div class="story-text">' + esc(s.story || '') + '</div>'
+            + (s.lesson ? '<div class="story-lesson">→ ' + esc(s.lesson) + '</div>' : '')
+            + (s.tags && s.tags.length ? '<div class="story-tags">' + s.tags.map(function(t){ return '<span class="tag">' + esc(t) + '</span>'; }).join('') + '</div>' : '')
+            + '<button class="btn btn-reject" style="font-size:10px;margin-top:5px" onclick="deleteStory(\'' + s.id + '\')">Delete</button>'
+            + '</div>';
+        }).join('')
+      + '<div style="margin-top:12px;border-top:1px solid #333;padding-top:12px">'
+      + '<div style="font-size:12px;color:#888;margin-bottom:6px">Add a story</div>'
+      + '<textarea id="newStory" placeholder="What happened? Be specific — time, place, what you observed..." class="edit-area" style="min-height:80px"></textarea>'
+      + '<input id="newLesson" placeholder="Lesson / punchline" class="gen-input" style="margin-bottom:6px">'
+      + '<button class="btn btn-approve" onclick="addStoryDash()">Add Story</button>'
+      + '<div id="storyDashStatus" style="font-size:11px;color:#4ade80;margin-top:5px"></div>'
+      + '</div></div>';
+  }
+
+  // Settings tab
+  if (tab === 'settings') {
+    const pct = trustSettings.per_channel_trust || {};
+    const trustLabels = ['Manual (0)', '30-min auto (1)', 'Instant (2)'];
+    tabContent = '<div class="section">'
+      + '<div class="section-header"><h2>Trust Levels</h2><a href="/onboarding" class="btn btn-edit" style="text-decoration:none">Edit Voice DNA</a></div>'
+      + '<p style="font-size:12px;color:#888;margin-bottom:10px">Control how much autonomy the system has per channel.</p>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+      + '<tr style="color:#888"><th style="text-align:left;padding:4px 8px">Channel</th><th style="text-align:left;padding:4px 8px">Trust Level</th></tr>'
+      + ['twitter','linkedin','reels','threads'].map(function(ch) {
+          var lvl = pct[ch] || 0;
+          return '<tr style="border-top:1px solid #333">'
+            + '<td style="padding:6px 8px;text-transform:capitalize">' + ch + '</td>'
+            + '<td style="padding:6px 8px">'
+            + '<select class="trust-select" data-channel="' + ch + '" onchange="setChannelTrust(\'' + ch + '\',this.value)" style="background:#1a1a1a;border:1px solid #333;color:#e0e0e0;padding:3px 8px;border-radius:4px;font-size:11px">'
+            + trustLabels.map(function(l,i){ return '<option value="'+i+'"'+(i===lvl?' selected':'')+'>'+l+'</option>'; }).join('')
+            + '</select></td></tr>';
+        }).join('')
+      + '</table>'
+      + '<div id="trustStatus" style="font-size:11px;color:#4ade80;margin-top:8px"></div>'
+      + '</div>'
+      + '<div class="section">'
+      + '<h2>Onboarding Status</h2>'
+      + '<p style="font-size:12px;color:#888;margin-bottom:8px">'
+      + (onboardingDone ? '✓ Voice DNA set up.' : '⚠ Voice DNA not complete.')
+      + ' Stories: ' + userStories.length + '/5 minimum.'
+      + '</p>'
+      + '<a href="/onboarding" class="btn btn-approve" style="text-decoration:none">' + (onboardingDone ? 'Re-do Voice DNA' : 'Complete Onboarding') + '</a>'
+      + '</div>';
+  }
+
   const html = `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2279,6 +2970,23 @@ h1{font-size:20px;margin-bottom:2px}
 .schedule-picker{display:flex;gap:3px;align-items:center;margin-top:5px;flex-wrap:wrap}
 .sched-label{font-size:10px;color:#888;margin-right:3px}
 .sched-btn{padding:3px 8px;border-radius:3px;border:1px solid #333;background:#1a1a1a;color:#facc15;cursor:pointer;font-size:10px}
+.score-breakdown{display:flex;gap:4px;font-size:9px;color:#888}
+.score-breakdown span{background:#1a1a1a;border:1px solid #333;padding:1px 4px;border-radius:3px}
+.score-breakdown .score-avg{background:#1e3a5f;color:#38bdf8}
+.story-card{background:#1a1a1a;border:1px solid #333;border-radius:7px;padding:10px;margin-bottom:7px}
+.story-text{font-size:12px;line-height:1.5;margin-bottom:4px}
+.story-lesson{font-size:11px;color:#4ade80;margin-bottom:4px}
+.story-tags{display:flex;gap:3px;flex-wrap:wrap}
+.brief-section{animation:pulse-border 2s ease-in-out infinite alternate}
+@keyframes pulse-border{from{border-color:#7c3aed}to{border-color:#a78bfa}}
+.li-modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.8);z-index:1000;align-items:center;justify-content:center}
+.li-modal.open{display:flex}
+.li-modal-box{background:#161616;border:1px solid #7c3aed;border-radius:12px;padding:20px;max-width:500px;width:90%;max-height:80vh;overflow:auto}
+.li-modal-box h3{font-size:15px;margin-bottom:8px;color:#a78bfa}
+.li-modal-content{background:#111;border:1px solid #333;border-radius:6px;padding:10px;font-size:13px;white-space:pre-wrap;line-height:1.5;max-height:200px;overflow:auto;margin-bottom:10px;user-select:all}
+.li-modal-btns{display:flex;gap:8px;flex-wrap:wrap}
+.toast{position:fixed;bottom:20px;right:20px;background:#1e293b;border:1px solid #4ade80;color:#4ade80;padding:10px 16px;border-radius:8px;font-size:12px;z-index:9999;opacity:0;transition:opacity .3s;pointer-events:none}
+.toast.show{opacity:1}
 .sched-btn:hover{background:#334155;border-color:#facc15}
 .btn-regen{background:#1e293b;color:#c084fc}.btn-regen:hover{background:#334155}
 .regen-box{display:flex;gap:4px;margin-top:5px;align-items:center}
@@ -2317,8 +3025,27 @@ h1{font-size:20px;margin-bottom:2px}
   <a class="tab ${tab==='twitter'?'active':''}" href="/dashboard?tab=twitter">Tweets<span class="cnt">${counts.twitter}</span></a>
   <a class="tab ${tab==='linkedin'?'active':''}" href="/dashboard?tab=linkedin">LinkedIn<span class="cnt">${counts.linkedin}</span></a>
   <a class="tab ${tab==='reels'?'active':''}" href="/dashboard?tab=reels">Reels<span class="cnt">${counts.reels}</span></a>
+  <a class="tab ${tab==='stories'?'active':''}" href="/dashboard?tab=stories">Stories<span class="cnt">${counts.stories}</span></a>
   <a class="tab ${tab==='approved'?'active':''}" href="/dashboard?tab=approved">All<span class="cnt">${counts.approved}</span></a>
+  <a class="tab ${tab==='settings'?'active':''}" href="/dashboard?tab=settings" style="flex:0.6">⚙</a>
 </div>
+
+<!-- LinkedIn modal -->
+<div class="li-modal" id="liModal">
+  <div class="li-modal-box">
+    <h3>Post to LinkedIn</h3>
+    <p style="font-size:12px;color:#888;margin-bottom:8px">1. Copy content below → 2. Open LinkedIn → 3. Paste and post</p>
+    <div class="li-modal-content" id="liModalContent"></div>
+    <div class="li-modal-btns">
+      <button class="btn btn-approve" onclick="copyLiContent()">Copy Content</button>
+      <a id="liOpenBtn" class="btn btn-li" href="#" target="_blank" onclick="closeLiModal()">Open LinkedIn →</a>
+      <button class="btn btn-reject" onclick="closeLiModal()">Close</button>
+    </div>
+    <div id="liModalStatus" style="font-size:11px;color:#4ade80;margin-top:8px"></div>
+  </div>
+</div>
+<!-- Toast -->
+<div class="toast" id="toast"></div>
 
 ${tabContent}
 
@@ -2332,7 +3059,29 @@ ${tabContent}
 function toggleEdit(id){var t=document.getElementById('text-'+id),e=document.getElementById('edit-'+id);if(e.style.display==='none'){e.style.display='block';t.style.display='none';e.focus()}else{e.style.display='none';t.style.display='block'}}
 function getPostContent(id){var e=document.getElementById('edit-'+id);if(e&&e.style.display!=='none')return e.value;var t=document.getElementById('text-'+id);return t?t.textContent:''}
 function approveAndTweet(id){var c=getPostContent(id);window.open('https://twitter.com/intent/tweet?text='+encodeURIComponent(c),'_blank');var e=document.getElementById('edit-'+id);var ed=e&&e.style.display!=='none';fetch(ed?'/api/edit/'+id:'/api/approve-and-tweet/'+id,{method:'POST',headers:ed?{'Content-Type':'application/json'}:{},body:ed?JSON.stringify({content:c}):undefined}).then(function(){setTimeout(function(){location.reload()},500)})}
-function approveAndLinkedIn(id){var c=getPostContent(id),e=document.getElementById('edit-'+id),ed=e&&e.style.display!=='none';fetch(ed?'/api/edit/'+id:'/api/approve/'+id,{method:'POST',headers:ed?{'Content-Type':'application/json'}:{},body:ed?JSON.stringify({content:c}):undefined}).then(function(){navigator.clipboard.writeText(c).then(function(){window.open('https://www.linkedin.com/feed/?shareActive=true&text='+encodeURIComponent(c),'_blank');setTimeout(function(){location.reload()},1000)})})}
+function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(function(){t.classList.remove('show')},2500)}
+function approveAndLinkedIn(id){
+  var c=getPostContent(id),e=document.getElementById('edit-'+id),ed=e&&e.style.display!=='none';
+  // First approve the post
+  fetch(ed?'/api/edit/'+id:'/api/approve/'+id,{method:'POST',headers:ed?{'Content-Type':'application/json'}:{},body:ed?JSON.stringify({content:c}):undefined})
+    .then(function(){
+      // Show LinkedIn modal instead of relying on URL params
+      document.getElementById('liModalContent').textContent=c;
+      document.getElementById('liOpenBtn').href='https://www.linkedin.com/feed/?shareActive=true&text='+encodeURIComponent(c.slice(0,2900));
+      document.getElementById('liModal').classList.add('open');
+      document.getElementById('liModalStatus').textContent='';
+    });
+}
+function closeLiModal(){document.getElementById('liModal').classList.remove('open');location.reload()}
+function copyLiContent(){
+  var c=document.getElementById('liModalContent').textContent;
+  navigator.clipboard.writeText(c).then(function(){
+    showToast('Copied to clipboard!');
+    document.getElementById('liModalStatus').textContent='Copied! Now paste into LinkedIn.';
+  }).catch(function(){
+    document.getElementById('liModalStatus').textContent='Manual copy: select all text above and copy.';
+  });
+}
 function approvePost(id){fetch('/api/approve/'+id,{method:'POST'}).then(function(){location.reload()})}
 function rejectPost(id){fetch('/api/reject/'+id,{method:'POST'}).then(function(){location.reload()})}
 function copyFromPost(id){var c=getPostContent(id);navigator.clipboard.writeText(c).then(function(){var b=document.getElementById('post-'+id).querySelectorAll('.btn-copy');b.forEach(function(x){x.textContent='Copied!';setTimeout(function(){x.textContent='Copy'},1500)})})}
@@ -2348,6 +3097,17 @@ function runScout(){var b=document.getElementById('scoutBtn');if(b){b.textConten
 function generate(style){var topic=document.getElementById('genTopic');var t=topic?topic.value:'';var status=document.getElementById('genStatus');var btns=document.querySelectorAll('.gen-style');btns.forEach(function(b){b.classList.add('loading')});if(status)status.textContent='Generating...';var platform=style==='linkedin'?'linkedin':(style==='reels'?'reels':'twitter');fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:platform,style:style,topic:t||undefined})}).then(function(r){return r.json()}).then(function(d){btns.forEach(function(b){b.classList.remove('loading')});if(d.ok){if(status)status.textContent='Done!';setTimeout(function(){location.reload()},500)}else{if(status)status.textContent='Error: '+(d.error||'unknown')}}).catch(function(e){btns.forEach(function(b){b.classList.remove('loading')});if(status)status.textContent='Error: '+e.message})}
 function genInsight(){var t=document.getElementById('insightTopic');var s=document.getElementById('insightStatus');s.textContent='Generating insight across all platforms...';fetch('/api/insight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic:t?t.value:''})}).then(function(r){return r.json()}).then(function(d){if(d.ok){s.textContent='Insight generated! Check all platform tabs.';setTimeout(function(){location.reload()},1000)}else{s.textContent='Error: '+(d.error||'unknown')}}).catch(function(e){s.textContent='Error: '+e.message})}
 function renderReel(id){var s=document.getElementById('render-'+id);if(s)s.textContent='Rendering video... (TTS + FFmpeg, may take 30-60s)';fetch('/api/render-reel/'+id,{method:'POST',headers:{'Content-Type':'application/json'}}).then(function(r){return r.json()}).then(function(d){if(d.ok){if(s)s.innerHTML='Done! <a href="'+d.video_url+'" target="_blank" style="color:#4ade80">Download MP4</a>';setTimeout(function(){location.reload()},2000)}else{if(s)s.textContent='Error: '+(d.error||'unknown')}}).catch(function(e){if(s)s.textContent='Error: '+e.message})}
+// Brief functions
+function confirmBrief(){fetch('/api/brief',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'confirmed'})}).then(function(){showToast('Brief confirmed!');document.getElementById('briefStatus').textContent='✓ Confirmed — generation will use this angle.'})}
+function changeBrief(){var s=document.getElementById('briefStatus');s.textContent='Generating alternatives...';fetch('/api/brief/alternatives',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_topic:''})}).then(function(r){return r.json()}).then(function(d){if(d.ok){var txt=d.alternatives.map(function(a,i){return (i+1)+'. ['+a.framework+'] '+a.topic+' — '+a.angle}).join('\n');s.textContent='Alternatives:\n'+txt+'\n\nReload to see updated brief or edit manually.'}else{s.textContent='Failed to get alternatives.'}})}
+function editBriefToggle(){var el=document.getElementById('briefEdit');el.style.display=el.style.display==='none'?'block':'none'}
+function saveBriefEdit(){fetch('/api/brief',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic:document.getElementById('briefTopic').value,angle:document.getElementById('briefAngle').value,hook_direction:document.getElementById('briefHook').value,status:'confirmed'})}).then(function(){showToast('Brief updated!');document.getElementById('briefEdit').style.display='none';document.getElementById('briefStatus').textContent='Brief saved.'})}
+// Story bank functions
+function addStoryDash(){var st=document.getElementById('newStory').value.trim(),le=document.getElementById('newLesson').value.trim();if(!st)return;document.getElementById('storyDashStatus').textContent='Adding...';fetch('/api/stories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({story:st,lesson:le})}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('Story added!');document.getElementById('storyDashStatus').textContent='Added ('+d.total+' total). Reload to see.';document.getElementById('newStory').value='';document.getElementById('newLesson').value=''}})}
+function deleteStory(id){if(!confirm('Delete this story?'))return;fetch('/api/stories/'+id,{method:'DELETE'}).then(function(){location.reload()})}
+// Trust functions
+function setChannelTrust(ch,lvl){fetch('/api/trust',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch,level:parseInt(lvl)})}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast(ch+' trust set to '+lvl);document.getElementById('trustStatus').textContent=ch+' trust level saved.'}else{document.getElementById('trustStatus').textContent='Failed.'}})}
+
 if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();
 var lastPC=${pendingCount};
 setInterval(function(){fetch('/api/pending').then(function(r){return r.json()}).then(function(d){var n=d.total||0;if(n>lastPC&&Notification.permission==='granted')new Notification('Content Machine',{body:(n-lastPC)+' new posts ready'});lastPC=n;document.title=n>0?'('+n+') Content Machine':'Content Machine'})},300000);
@@ -2381,32 +3141,8 @@ ${posts.map(p => `  <item>
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// PHASE 3: Trust Levels + Auto-Post
+// PHASE 3: Auto-Post + Repurpose (Trust levels now handled above)
 // ══════════════════════════════════════════════════════════════════════════════
-
-// ── API: Trust Level ─────────────────────────────────────────────────────────
-
-app.get('/api/trust', (req, res) => {
-  const stateDir = path.join(req.userDataDir, 'state');
-  fs.mkdirSync(stateDir, { recursive: true });
-  const trustFile = path.join(stateDir, 'trust.json');
-  try {
-    const data = JSON.parse(fs.readFileSync(trustFile, 'utf8'));
-    res.json(data);
-  } catch {
-    res.json({ trust_level: 0 });
-  }
-});
-
-app.post('/api/trust', (req, res) => {
-  const { level } = req.body;
-  const lvl = parseInt(level);
-  if (isNaN(lvl) || lvl < 0 || lvl > 2) return res.status(400).json({ error: 'level must be 0, 1, or 2' });
-  const stateDir = path.join(req.userDataDir, 'state');
-  fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(path.join(stateDir, 'trust.json'), JSON.stringify({ trust_level: lvl, updated_at: new Date().toISOString() }));
-  res.json({ ok: true, trust_level: lvl });
-});
 
 // ── API: Auto-approve (for trust level 1/2 automation) ───────────────────────
 
