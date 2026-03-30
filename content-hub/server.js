@@ -516,7 +516,7 @@ function checkScheduledPosts() {
           type: 'approved',
           post_id: post.id,
           platform: post.platform,
-          format: post.format || 'unknown',
+          format: normalizeFormat(post.format),
           content_preview: (post.content || '').slice(0, 100),
           pillar: post.pillar,
           scheduled: true,
@@ -632,8 +632,167 @@ const SLOP_PHRASES = [
   "paradigm shift", "circle back", "let that sink in", "here's the thing",
   "the reality is", "make no mistake", "at its core", "in a nutshell",
   "long story short", "without further ado", "needless to say", "it goes without saying",
-  "i'm thrilled to share", "excited to announce", "passionate about"
+  "i'm thrilled to share", "excited to announce", "passionate about",
+  "by leveraging", "tap into", "it's worth noting", "it's important to",
+  "in today's landscape", "in today's digital world", "in today's era",
+  "it cannot be overstated", "to be honest", "the bottom line is",
+  "food for thought", "hot take:", "unpopular opinion:", "hear me out"
 ];
+
+// ── Tweet Formatter (hard enforcement) ──────────────────────────────────────
+
+function formatTweet(content) {
+  if (!content) return content;
+  let text = content.trim();
+  // If already has line breaks, leave mostly alone
+  if ((text.match(/\n/g) || []).length >= 2) return text;
+  // Split on sentence boundaries
+  const parts = text.split(/(?<=[.!?])\s+/).filter(p => p.trim());
+  if (parts.length <= 1) return text;
+  // Rejoin with double newlines, keeping short fragments together
+  const lines = [];
+  for (let i = 0; i < parts.length; i++) {
+    const cur = parts[i];
+    const next = parts[i + 1];
+    if (next && cur.split(/\s+/).length <= 5 && next.split(/\s+/).length <= 5) {
+      lines.push(cur + ' ' + next);
+      i++;
+    } else {
+      lines.push(cur);
+    }
+  }
+  const formatted = lines.join('\n\n');
+  // Check char count (newlines = 1 char on Twitter)
+  return formatted.length <= 280 ? formatted : text;
+}
+
+// ── Hook Strength Anti-Patterns ─────────────────────────────────────────────
+
+const WEAK_HOOK_PATTERNS = [
+  /^what if you could/i, /^most people think/i, /^most people don't/i,
+  /^here'?s (the thing|what)/i, /^let me (tell|explain)/i,
+  /^i'?ve been thinking/i, /^today i want to/i, /^so i was/i,
+  /^this is a (story|thread)/i, /^unpopular opinion/i, /^hot take:/i,
+  /^hear me out/i, /^a thread:/i, /^thread:/i,
+  /won'?t (be replaced|die|fail|end)/i, // negation hooks are weak
+  /10x (faster|better|more)/i, /efficiently/i
+];
+
+function hookStrengthCheck(content) {
+  const firstLine = (content || '').split('\n')[0].trim();
+  for (const p of WEAK_HOOK_PATTERNS) {
+    if (p.test(firstLine)) return { pass: false, reason: 'weak hook pattern: ' + p.source };
+  }
+  // Must contain either a number, a named entity, or a direct strong claim
+  const hasNumber = /\d/.test(firstLine);
+  const hasEntity = /\b[A-Z][a-zA-Z]{2,}/.test(firstLine);
+  const isShortAndPunchy = firstLine.split(/\s+/).length <= 10;
+  if (!hasNumber && !hasEntity && !isShortAndPunchy) return { pass: false, reason: 'no specificity in hook — needs number or named entity' };
+  return { pass: true };
+}
+
+// ── Story Mining ────────────────────────────────────────────────────────────
+
+async function mineStory(story, topic) {
+  if (!story || !story.story || !story.lesson) return null;
+  try {
+    const raw = await callGroq('You extract the surprising, counterintuitive detail from real stories.',
+      'Story: "' + story.story + '"\nLesson: "' + story.lesson + '"\nToday\'s topic: "' + (topic || 'general') + '"\n\nExtract the most surprising or counterintuitive detail — NOT the outcome, but the unexpected thing that happened. Return ONLY valid JSON:\n{"surprising_detail":"string","why_unexpected":"string","tension":"the contradiction or paradox this creates"}',
+      { temperature: 0.7, max_tokens: 200 });
+    const m = raw.match(/\{[\s\S]*\}/);
+    return m ? JSON.parse(m[0]) : null;
+  } catch { return null; }
+}
+
+// ── AHA Test with Concrete Rubric ───────────────────────────────────────────
+
+function buildAHARubric(content, platform) {
+  return `Score this post 1-10 on originality. Use this concrete scale:
+
+1-3 (DO NOT POST — common consensus):
+"AI will replace jobs" / "Open source beats closed source" / "Ship fast and iterate" / "Consistency is key to growth" — everyone says these, zero information added
+
+4-5 (Weak — slightly differentiated but predictable):
+"Most founders underestimate distribution" / "The best code is no code" — has a direction but anyone could have said it
+
+6-7 (Acceptable — specific angle but not surprising):
+"I built X in Y days" without the unexpected part / general advice grounded in experience but not counterintuitive
+
+8-9 (Strong — connects two things unexpectedly):
+"The Indian startup ecosystem rewards talking about building more than actually building. I have shipped 4 products with 0 followers and 3 paying users." — specific, counterintuitive, earned opinion
+
+10 (Exceptional — reader stops and thinks differently):
+The insight is so specific and counterintuitive that the reader's mental model must update to accommodate it.
+
+INDIA BONUS: If the post contains a specific India angle (Indian markets, Indian dev culture, UPI, WhatsApp, Tier 2/3 cities) that a US founder couldn't have written, add 1 point.
+
+Post to score: "${content}"
+
+Return ONLY valid JSON: {"score": N, "diagnosis": "one sentence — what's wrong if <7, what works if >=8", "india_bonus": true/false}`;
+}
+
+// ── Emotion Mechanics ───────────────────────────────────────────────────────
+
+const EMOTION_REQUIREMENTS = {
+  anger: { check: (c) => /\b(wrong|broken|unfair|scam|waste|lie|fail|abuse|exploit)\b/i.test(c), fail: 'anger requires naming something specific that is wrong or unfair' },
+  superiority: { check: (c) => /\d/.test(c) || /\b(nobody|few people|most .+ don.?t|insider|secret)\b/i.test(c), fail: 'superiority needs insider info most readers don\'t know' },
+  fear: { check: (c) => /\b(threat|risk|danger|miss|behind|losing|replace|die|kill)\b/i.test(c), fail: 'fear needs a specific named threat, not vague worry' },
+  hope: { check: (c) => /\b(path|way|possible|achieve|build|start|now|can|opportunity)\b/i.test(c), fail: 'hope needs a concrete path or next step, not just optimism' }
+};
+
+function emotionCheck(content, emotion) {
+  const req = EMOTION_REQUIREMENTS[emotion];
+  if (!req) return { pass: true };
+  return req.check(content) ? { pass: true } : { pass: false, reason: req.fail };
+}
+
+// ── India Angle Detection ───────────────────────────────────────────────────
+
+const INDIA_TOPICS = ['startup', 'ai tool', 'developer', 'saas', 'whatsapp', 'mobile-first', 'bootstrap', 'upi', 'india', 'indian', 'tier 2', 'tier 3', 'jugaad', 'rupee', 'rs ', 'inr', 'crore', 'lakh'];
+
+function isIndiaRelevant(topic) {
+  const lower = (topic || '').toLowerCase();
+  return INDIA_TOPICS.some(t => lower.includes(t));
+}
+
+const INDIA_LENS_PROMPT = `
+INDIA DIFFERENTIATION: Deep's unique angle is the India lens. When relevant, ground content in:
+- Indian market realities (pricing, competition, distribution)
+- Indian developer culture (jugaad, shipping under constraints, bootstrapped vs VC)
+- Indian internet context (UPI, WhatsApp as default platform, Tier 2/3 cities)
+This is what US tech Twitter cannot replicate. Use it.
+
+India-angle hook templates when applicable:
+- "In India, [common Western assumption] is [completely different reality]"
+- "Indian [market/developers/founders] figured out [thing] 5 years before [US equivalent]"
+- "[specific Indian platform/behaviour] is doing [thing] that Silicon Valley is still theorising about"
+`;
+
+// ── Platform-Specific Prompt Modules ────────────────────────────────────────
+
+function buildTwitterPrompt(identity, perfLayer, storyLayer, antiRepeat, prefSummary, weeklyLearnings, indiaLens) {
+  return identity +
+    '\n\nTWITTER VOICE: How Deep texts a smart friend at 11pm when he\'s just figured something out. Raw. Short. Conviction. Not polished.' +
+    '\n\nTWITTER RULES:\n- Under 240 chars recommended, hard stop 280\n- One idea only — no sub-points\n- Blank line between every 1-2 sentences\n- No em dashes as substitutes for line breaks\n- No bullet points\n- Ends on conviction, never on a question unless the question IS the point\n- No "most people think" openers\n- FORMAT: Each sentence on its own line with blank line between' +
+    perfLayer + storyLayer + antiRepeat + prefSummary + weeklyLearnings + (indiaLens || '');
+}
+
+function buildLinkedInPrompt(identity, perfLayer, storyLayer, antiRepeat, prefSummary, weeklyLearnings, indiaLens) {
+  return identity +
+    '\n\nLINKEDIN VOICE: How Deep would write if he had 5 minutes to convince someone he\'d never met to follow him. Professional but opinionated. Authority through specifics not titles.' +
+    '\n\nLINKEDIN RULES:\n- Line 1-2 = hook (must work as standalone tweet — if it needs context it fails)\n- Line 3 = blank line\n- Lines 4-12 = argument with one idea per paragraph, max 2 lines each\n- Final paragraph = specific CTA or provocation that makes readers comment\n- FORBIDDEN: "By leveraging", "In today\'s landscape", "As a [title]", "I\'m excited to share", bullet points, numbered lists' +
+    perfLayer + storyLayer + antiRepeat + prefSummary + weeklyLearnings + (indiaLens || '');
+}
+
+function buildReelsPrompt(identity, perfLayer, storyLayer, prefSummary, indiaLens) {
+  return identity +
+    '\n\nREELS VOICE: How Deep would explain something exciting to his phone camera while walking. Spoken words, not formal sentences.' +
+    '\n\nREELS RULES:\n- Hook: 3 seconds, under 8 words, creates a question or shows something unexpected\n- 3-4 beats: each 5-8 seconds, one visual idea per beat\n- CTA: 5 seconds, specific ask\n- FORBIDDEN: "What if you could", "10x faster", "efficiently", "leverage"' +
+    perfLayer + storyLayer + prefSummary + (indiaLens || '');
+}
+
+// Normalize format names (Bug fix: case inconsistency)
+function normalizeFormat(fmt) { return (fmt || 'unknown').toLowerCase().trim(); }
 
 function qualityGate(content, platform) {
   const errors = [];
@@ -727,7 +886,31 @@ function buildLayeredPrompt(userDataDir, pubDir, decDir, topic, platform) {
     if (wl.learnings) weeklyLearnings = '\n\nTHIS WEEK\'S LEARNINGS (apply to this generation):\n' + wl.learnings;
   } catch {}
 
-  return identity + performance + storyLayer + antiRepeat + prefSummary + weeklyLearnings;
+  // Layer 7: India lens (when relevant)
+  const indiaLens = isIndiaRelevant(topic) ? INDIA_LENS_PROMPT : '';
+
+  // Layer 8: Forbidden patterns (living voice context)
+  let forbiddenPatterns = '';
+  try {
+    const fp = JSON.parse(fs.readFileSync(path.join(userDataDir, 'state/forbidden_patterns.json'), 'utf8'));
+    if (fp.length > 0) forbiddenPatterns = '\n\nFORBIDDEN PATTERNS (from rejected posts — avoid these):\n' + fp.map(p => '- ' + p.pattern).join('\n');
+  } catch {}
+
+  // Layer 9: Proven bangers (living voice context)
+  let bangersLayer = '';
+  try {
+    const bp = JSON.parse(fs.readFileSync(path.join(userDataDir, 'state/proven_bangers.json'), 'utf8'));
+    if (bp.length > 0) bangersLayer = '\n\nPROVEN BANGERS (your best work — match this energy):\n' + bp.slice(0, 10).map(b => '- ' + b.content.slice(0, 120)).join('\n');
+  } catch {}
+
+  // Use platform-specific prompt module
+  if (platform === 'linkedin') {
+    return buildLinkedInPrompt(identity, performance, storyLayer, antiRepeat, prefSummary, weeklyLearnings, indiaLens) + forbiddenPatterns + bangersLayer;
+  } else if (platform === 'reels') {
+    return buildReelsPrompt(identity, performance, storyLayer, prefSummary, indiaLens) + forbiddenPatterns + bangersLayer;
+  }
+  // Default: Twitter
+  return buildTwitterPrompt(identity, performance, storyLayer, antiRepeat, prefSummary, weeklyLearnings, indiaLens) + forbiddenPatterns + bangersLayer;
 }
 
 function escapeXml(str) {
@@ -743,15 +926,12 @@ function escapeXml(str) {
 
 function calculateVoiceScore(userDataDir) {
   const decDir = path.join(userDataDir, 'decisions');
-  const pubDir = path.join(userDataDir, 'published');
-  const weekAgo = Date.now() - 7 * 86400000;
   let totalDec = 0, approved = 0, edited = 0, rejected = 0, regens = 0;
   try {
     const files = fs.readdirSync(decDir).filter(f => f.endsWith('.json'));
     for (const f of files) {
       try {
         const d = JSON.parse(fs.readFileSync(path.join(decDir, f), 'utf8'));
-        if (new Date(d.at).getTime() < weekAgo) continue;
         totalDec++;
         if (d.type === 'approved') approved++;
         else if (d.type === 'edited') edited++;
@@ -761,20 +941,25 @@ function calculateVoiceScore(userDataDir) {
     }
   } catch {}
 
-  // Quality gate pass rate (simulated from approval rate)
-  const gateScore = totalDec > 0 ? Math.round((approved / totalDec) * 100) : 50;
-  // Approval without edits
-  const approvalScore = totalDec > 0 ? Math.round(((approved) / Math.max(approved + edited + rejected, 1)) * 100) : 50;
-  // Regen frequency (lower = better)
-  const regenScore = totalDec > 0 ? Math.max(0, Math.round(100 - (regens / totalDec) * 200)) : 50;
-  // Story count bonus
-  const stories = loadStories(userDataDir);
-  const storyBonus = Math.min(stories.length * 4, 20);
+  // Minimum threshold — need 30+ decisions for meaningful score
+  if (totalDec < 30) {
+    return { score: null, state: 'insufficient_data', message: 'Need ' + (30 - totalDec) + ' more decisions. Keep reviewing posts.', decisions: totalDec, breakdown: {} };
+  }
 
-  // Weighted composite
-  const score = Math.min(100, Math.round(gateScore * 0.25 + approvalScore * 0.35 + regenScore * 0.20 + storyBonus + 10));
-  const trend = approvalScore > 60 ? '+' : (approvalScore < 40 ? '-' : '=');
-  return { score, trend, breakdown: { gate_pass: gateScore, approval_clean: approvalScore, regen_rate: regenScore, story_bonus: storyBonus } };
+  // Components as weighted fractions summing to 100
+  const gateScore = Math.round((approved / totalDec) * 25); // max 25 pts
+  const approvalScore = Math.round((approved / Math.max(approved + edited + rejected, 1)) * 35); // max 35 pts
+  const regenScore = Math.max(0, Math.round((1 - regens / totalDec) * 20)); // max 20 pts
+  const stories = loadStories(userDataDir);
+  const fingerprint = Math.min(Math.round(stories.length * 2), 20); // max 20 pts (proxy for voice similarity)
+
+  const score = Math.min(100, gateScore + approvalScore + regenScore + fingerprint);
+  // Story bonus: up to 10 extra points beyond 100 to incentivize story bank
+  const storyBonus = Math.min(Math.max(0, stories.length - 5) * 2, 10);
+  const finalScore = Math.min(110, score + storyBonus);
+
+  const trend = approvalScore > 20 ? '+' : (approvalScore < 10 ? '-' : '=');
+  return { score: finalScore, trend, decisions: totalDec, breakdown: { gate_pass: gateScore, approval_clean: approvalScore, regen_rate: regenScore, fingerprint, story_bonus: storyBonus } };
 }
 
 // ── Ghost Mode Logic ────────────────────────────────────────────────────────
@@ -986,7 +1171,7 @@ app.post('/api/approve/:id', (req, res) => {
     type: 'approved',
     post_id: post.id,
     platform: post.platform,
-    format: post.format || 'unknown',
+    format: normalizeFormat(post.format),
     content_preview: (post.content || '').slice(0, 100),
     pillar: post.pillar,
     trend: post.trend,
@@ -997,9 +1182,10 @@ app.post('/api/approve/:id', (req, res) => {
   res.json({ ok: true, id: post.id, url: `${SITE_URL}/post/${post.id}` });
 });
 
-app.post('/api/reject/:id', (req, res) => {
+app.post('/api/reject/:id', async (req, res) => {
   const pendDir = path.join(req.userDataDir, 'pending');
   const decDir = path.join(req.userDataDir, 'decisions');
+  const stateDir = path.join(req.userDataDir, 'state');
   const pendingFile = path.join(pendDir, `${req.params.id}.json`);
   if (!fs.existsSync(pendingFile)) return res.status(404).json({ error: 'not found' });
 
@@ -1009,13 +1195,30 @@ app.post('/api/reject/:id', (req, res) => {
     type: 'rejected',
     post_id: req.params.id,
     platform: rejectedPost.platform,
-    format: rejectedPost.format || 'unknown',
+    format: normalizeFormat(rejectedPost.format),
     content_preview: (rejectedPost.content || '').slice(0, 100),
     pillar: rejectedPost.pillar,
     at: new Date().toISOString()
   }, null, 2));
 
   fs.unlinkSync(pendingFile);
+
+  // Living voice context: extract forbidden pattern from rejection
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    const pattern = await callGroq('You identify off-brand writing patterns.',
+      'This post was rejected: "' + (rejectedPost.content || '').slice(0, 200) + '"\nName the pattern that made it off-brand in 5 words or less. Return ONLY the pattern name.',
+      { temperature: 0.2, max_tokens: 20 });
+    const fpFile = path.join(stateDir, 'forbidden_patterns.json');
+    let patterns = [];
+    try { patterns = JSON.parse(fs.readFileSync(fpFile, 'utf8')); } catch {}
+    if (pattern && !patterns.find(p => p.pattern === pattern.trim())) {
+      patterns.push({ pattern: pattern.trim(), from_post: req.params.id, at: new Date().toISOString() });
+      if (patterns.length > 30) patterns = patterns.slice(-30);
+      fs.writeFileSync(fpFile, JSON.stringify(patterns, null, 2));
+    }
+  } catch {}
+
   res.json({ ok: true, rejected: req.params.id });
 });
 
@@ -1043,7 +1246,7 @@ app.post('/api/edit/:id', (req, res) => {
     type: 'edited',
     post_id: post.id,
     platform: post.platform,
-    format: post.format || 'unknown',
+    format: normalizeFormat(post.format),
     content_preview: (post.content || '').slice(0, 100),
     pillar: post.pillar,
     trend: post.trend,
@@ -1407,7 +1610,7 @@ app.post('/api/approve-and-tweet/:id', (req, res) => {
     type: 'approved',
     post_id: post.id,
     platform: post.platform,
-    format: post.format || 'unknown',
+    format: normalizeFormat(post.format),
     content_preview: (post.content || '').slice(0, 100),
     pillar: post.pillar,
     trend: post.trend,
@@ -1796,7 +1999,7 @@ app.post('/api/regenerate/:id', async (req, res) => {
       type: 'regenerated',
       post_id: post.id,
       platform: post.platform,
-      format: post.format || 'unknown',
+      format: normalizeFormat(post.format),
       original_preview: (req.body.original || post.content || '').slice(0, 100),
       comment: comment,
       at: new Date().toISOString()
@@ -2015,6 +2218,10 @@ app.post('/api/generate', genLimiter, async (req, res) => {
   const isReels = targetPlatform === 'reels' || chosenStyle === 'reels';
   const actualPlatform = isReels ? 'reels' : (isLinkedIn ? 'linkedin' : 'twitter');
 
+  // Pending queue cap check
+  const cap = checkPendingCap(req.userDataDir);
+  if (cap.capped) return res.status(429).json({ error: 'Pending queue has ' + cap.count + ' posts. Review or clear before generating more.' });
+
   // Check for today's brief as topic hint
   let briefTopic = topic;
   if (!briefTopic) {
@@ -2027,11 +2234,8 @@ app.post('/api/generate', genLimiter, async (req, res) => {
     } catch {}
   }
 
-  // Build layered system prompt
-  const sysPrompt = buildLayeredPrompt(req.userDataDir, pubDir, decDir, briefTopic, actualPlatform) +
-    (isLinkedIn ? '\n\nYou are writing a LinkedIn post. Professional but opinionated. Hook in first 2 lines above the fold. No bullshit.' :
-     isReels ? '\n\nYou are writing a Reels script. Hook must be under 8 words. Each beat punchy.' :
-     '\n\nYou ARE this person. Raw, short, no corporate speak. Match the examples.');
+  // Build layered system prompt (now uses platform-specific modules)
+  const sysPrompt = buildLayeredPrompt(req.userDataDir, pubDir, decDir, briefTopic, actualPlatform);
 
   const styleInstructions = {
     contrarian: 'Disagree with something everyone accepts. State the popular view, then destroy it with specifics.',
@@ -2046,11 +2250,17 @@ app.post('/api/generate', genLimiter, async (req, res) => {
     reels: 'Return JSON: {"hook":"under 8 words","beats":[{"voiceover":"...","visual":"...","duration":"Xs"}],"cta":"...","music_mood":"...","total_duration":"Xs"}'
   };
 
-  // HOOK-FIRST approach for Twitter: generate hook, then build post around it
+  // ── 3-STAGE PIPELINE (Sprint 3 architecture) ──────────────────────────────
   let finalContent = '';
+  let stageMetadata = {};
   try {
     if (actualPlatform === 'twitter') {
-      // Step 1: Generate hook
+      // Story mining
+      const stories = getRelevantStories(req.userDataDir, briefTopic, 1);
+      let minedStory = null;
+      if (stories.length > 0) minedStory = await mineStory(stories[0], briefTopic);
+
+      // Select emotion BEFORE generation
       const emotion = ['anger', 'fear', 'superiority', 'hope'][Math.floor(Math.random() * 4)];
       const frameworks = ['HIDDEN WINNER: Who benefits that nobody talks about?',
         'CONTRADICTION: What does conventional wisdom get wrong?',
@@ -2059,46 +2269,77 @@ app.post('/api/generate', genLimiter, async (req, res) => {
         'INDIA ANGLE: How does this play out differently in India?'];
       const framework = frameworks[Math.floor(Math.random() * frameworks.length)];
 
+      // STAGE 1 — Hook generation (5 candidates, return best)
       const hookPrompt = (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') +
         'Target emotion: ' + emotion + '\n' +
-        'Framework to use: ' + framework + '\n\n' +
-        'Style: ' + (styleInstructions[chosenStyle] || styleInstructions.contrarian) + '\n\n' +
-        'Write ONLY the first line (the hook). It must:\n' +
-        '- Stop the scroll immediately\n' +
-        '- State the result, pain point, or controversial take directly\n' +
-        '- NOT start with "I\'ve been thinking", "Today I want to", or any setup\n' +
-        '- Be under 60 characters if possible\n' +
-        'Return ONLY the hook text, nothing else.';
+        'Framework: ' + framework + '\n' +
+        (minedStory ? 'Story tension to use: "' + minedStory.tension + '"\n' : '') +
+        (isIndiaRelevant(briefTopic) ? 'India lens required.\n' : '') +
+        '\nGenerate 5 possible hooks. Each must be under 15 words. Must fit one format:\n(A) specific number + unexpected context ("I charged Rs 0 for 6 months and got 150 paying users")\n(B) direct claim most would disagree with ("Cold email works better than LinkedIn for Indian B2B.")\n(C) paradox or internal contradiction ("The best code I wrote this year was code I deleted")\n\nFORBIDDEN: "what if", "most people think", "X will Y", "10x faster"\n\nReturn ONLY the single best hook as plain text.';
 
-      const hook = await callGroq(sysPrompt, hookPrompt, { temperature: 0.9, max_tokens: 80 });
+      let hook = await callGroq(sysPrompt, hookPrompt, { temperature: 0.9, max_tokens: 80 });
+      hook = hook.replace(/^["']|["']$/g, '').trim();
 
-      // Step 2: Build full tweet around the hook
-      let genAttempts = 0;
-      while (genAttempts < 2) {
-        const fullPrompt = 'Hook (first line — DO NOT change this): "' + hook.trim() + '"\n\n' +
-          'Now write the complete tweet STARTING with that exact hook.\n' +
-          'Style: ' + (styleInstructions[chosenStyle] || styleInstructions.contrarian) + '\n' +
-          'Rules:\n- Under 280 chars total\n- Line breaks between ideas\n- No emojis, no hashtags\n' +
-          '- Weave in a real story or specific experience\n- End with the implication or provocation\n' +
-          'Return ONLY the tweet text.';
-
-        finalContent = await callGroq(sysPrompt, fullPrompt, { temperature: 0.8, max_tokens: 200 });
-        const gate = qualityGate(finalContent, 'twitter');
-        if (gate.pass || genAttempts === 1) break;
-        genAttempts++;
+      // Validate hook
+      const hookCheck = hookStrengthCheck(hook);
+      if (!hookCheck.pass) {
+        hook = await callGroq(sysPrompt, 'The previous hook "' + hook + '" failed: ' + hookCheck.reason + '. Write a better hook. Specific number or named entity required. Under 15 words. Return ONLY the hook.', { temperature: 0.95, max_tokens: 60 });
+        hook = hook.replace(/^["']|["']$/g, '').trim();
       }
 
+      // STAGE 2 — Post body (hook is fixed first line)
+      let diagnosis = '';
+      let genAttempts = 0;
+      while (genAttempts < 3) {
+        const bodyPrompt = 'Hook (first line — DO NOT change): "' + hook + '"\n\n' +
+          'Build the complete tweet starting with that exact hook.\n' +
+          'Style: ' + (styleInstructions[chosenStyle] || styleInstructions.contrarian) + '\n' +
+          'Emotion mechanic: ' + emotion + '\n' +
+          (minedStory ? 'Surprising detail to weave in: "' + minedStory.surprising_detail + '" (tension: ' + minedStory.tension + ')\n' : '') +
+          'Rules:\n- Under 280 chars total\n- Each sentence on its own line with blank line between\n- No emojis, no hashtags\n- Must include at least one specific detail (number, name, tool, event)\n' +
+          (diagnosis ? 'FIX THIS: ' + diagnosis + '\n' : '') +
+          'Return ONLY the tweet text.';
+
+        finalContent = await callGroq(sysPrompt, bodyPrompt, { temperature: 0.85, max_tokens: 200 });
+
+        // Apply tweet formatter
+        finalContent = formatTweet(finalContent);
+
+        // Quality gate + hook strength
+        const gate = qualityGate(finalContent, 'twitter');
+        if (!gate.pass && genAttempts < 2) { diagnosis = gate.errors.join('; '); genAttempts++; continue; }
+
+        // STAGE 3 — Self-critique with AHA rubric
+        try {
+          const critiqueRaw = await callGroq('You are a ruthless content quality critic.', buildAHARubric(finalContent, 'twitter'), { temperature: 0.1, max_tokens: 150 });
+          const cm = critiqueRaw.match(/\{[\s\S]*\}/);
+          if (cm) {
+            const critique = JSON.parse(cm[0]);
+            stageMetadata.aha_score = critique.score;
+            stageMetadata.aha_diagnosis = critique.diagnosis;
+            stageMetadata.india_bonus = critique.india_bonus;
+            if (critique.score < 7 && genAttempts < 2) { diagnosis = critique.diagnosis; genAttempts++; continue; }
+          }
+        } catch {}
+
+        // Emotion check
+        const emCheck = emotionCheck(finalContent, emotion);
+        if (!emCheck.pass && genAttempts < 2) { diagnosis = emCheck.reason; genAttempts++; continue; }
+
+        break;
+      }
+      stageMetadata.emotion = emotion;
+      stageMetadata.framework = framework;
+      stageMetadata.mined_story = minedStory;
+
     } else if (isLinkedIn) {
-      const liPrompt = (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') +
-        styleInstructions.linkedin + '\n\n' +
-        'Rules:\n- Hook MUST be in first 2 lines (above the fold)\n- Line break after hook\n' +
-        '- 300-500 words\n- End with a question or CTA\n- No "I\'m thrilled to share" openers\n' +
-        'Return ONLY the post text.';
-      finalContent = await callGroq(sysPrompt, liPrompt, { temperature: 0.72, max_tokens: 700 });
+      finalContent = await callGroq(sysPrompt,
+        (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') + styleInstructions.linkedin +
+        '\n\nRules:\n- Hook MUST be in first 2 lines (above the fold)\n- Line break after hook\n- 300-500 words\n- End with a question or CTA\n- FORBIDDEN: "By leveraging", "In today\'s landscape", "I\'m excited to share", bullet points\nReturn ONLY the post text.',
+        { temperature: 0.72, max_tokens: 700 });
 
     } else if (isReels) {
-      const reelsPrompt = (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') + styleInstructions.reels;
-      const raw = await callGroq(sysPrompt, reelsPrompt, { temperature: 0.8, max_tokens: 600 });
+      const raw = await callGroq(sysPrompt, (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') + styleInstructions.reels, { temperature: 0.8, max_tokens: 600 });
       try {
         const script = JSON.parse(raw.replace(/```json|```/g, '').trim());
         finalContent = 'HOOK: ' + (script.hook || '') + '\n\n' +
@@ -2140,8 +2381,12 @@ app.post('/api/generate', genLimiter, async (req, res) => {
     content: finalContent,
     content_full: { tweet: finalContent },
     pillar: briefTopic || 'On Demand',
-    format: isReels ? 'reels_script' : (isLinkedIn ? 'linkedin_post' : (['blog', 'email'].includes(targetPlatform) ? targetPlatform + '_post' : chosenStyle)),
+    format: normalizeFormat(isReels ? 'reels_script' : (isLinkedIn ? 'linkedin_post' : (['blog', 'email'].includes(targetPlatform) ? targetPlatform + '_post' : chosenStyle))),
     image_prompt: imagePrompt,
+    aha_score: stageMetadata.aha_score || null,
+    emotion: stageMetadata.emotion || null,
+    framework: stageMetadata.framework || null,
+    quality_warning: stageMetadata.aha_score && stageMetadata.aha_score < 7 ? true : undefined,
     created_at: new Date().toISOString(),
     status: 'pending'
   };
@@ -3087,7 +3332,9 @@ app.get('/dashboard', (req, res) => {
     if (isPending) {
       actions = '<div class="actions">'
         + '<button class="btn btn-edit" onclick="toggleEdit(\'' + p.id + '\')">Edit</button>';
-      if (p.platform === 'linkedin') {
+      if (p.format === 'thread' && p.tweets) {
+        actions += '<button class="btn btn-approve" onclick="openThreadComposer(\'' + p.id + '\')" style="background:#7c3aed;color:#e9d5ff">Open Thread Composer</button>';
+      } else if (p.platform === 'linkedin') {
         actions += '<button class="btn btn-approve" onclick="approveAndLinkedIn(\'' + p.id + '\')">Approve & Post</button>';
       } else if (p.platform === 'reels') {
         actions += '<button class="btn btn-approve" onclick="approvePost(\'' + p.id + '\')">Approve</button>';
@@ -3274,7 +3521,11 @@ app.get('/dashboard', (req, res) => {
 
     tabContent = genSection;
     if (tabPending.length > 0) {
-      tabContent += '<div class="section section-pending"><h2>Pending</h2>' + tabPending.map(function(p) { return renderPost(p, true); }).join('') + '</div>';
+      tabContent += '<div class="section section-pending"><div class="section-header"><h2>Pending</h2>'
+        + (pendingCount > 15 ? '<div style="display:flex;gap:4px"><button class="btn btn-reject" onclick="clearOldPending()" style="font-size:10px">Clear old (24h+)</button><button class="btn btn-reject" onclick="clearAllPending()" style="font-size:10px">Clear all</button></div>' : '')
+        + '</div>'
+        + (pendingCount > 15 ? '<div style="background:#7f1d1d;border:1px solid #f87171;border-radius:6px;padding:8px;margin-bottom:8px;font-size:11px;color:#f87171">⚠ ' + pendingCount + ' unreviewed posts. Bulk approve or clear to continue generating.</div>' : '')
+        + tabPending.map(function(p) { return renderPost(p, true); }).join('') + '</div>';
     }
     if (tabApproved.length > 0) {
       tabContent += '<div class="section"><h2>Approved</h2>' + tabApproved.map(function(p) { return renderPost(p, false); }).join('') + '</div>';
@@ -3400,7 +3651,9 @@ app.get('/dashboard', (req, res) => {
       + '</div>';
   }
 
-  const vsColor = voiceScore.score >= 71 ? '#4ade80' : (voiceScore.score >= 41 ? '#facc15' : '#f87171');
+  const vsColor = voiceScore.score === null ? '#555' : (voiceScore.score >= 71 ? '#4ade80' : (voiceScore.score >= 41 ? '#facc15' : '#f87171'));
+  const vsDisplay = voiceScore.score === null ? '?' : voiceScore.score;
+  const vsTooltip = voiceScore.score === null ? voiceScore.message : ('Gate:' + (voiceScore.breakdown.gate_pass||0) + ' Approval:' + (voiceScore.breakdown.approval_clean||0) + ' Regen:' + (voiceScore.breakdown.regen_rate||0) + ' Fingerprint:' + (voiceScore.breakdown.fingerprint||0));
   const html = `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -3514,8 +3767,8 @@ h1{font-size:20px;margin-bottom:2px}
 <div class="header">
   <div>
     <h1>Content Machine</h1>
-    <div class="voice-score" title="Gate:${voiceScore.breakdown.gate_pass} Approval:${voiceScore.breakdown.approval_clean} Regen:${voiceScore.breakdown.regen_rate} Stories:${voiceScore.breakdown.story_bonus}">
-      <span class="vs-num">${voiceScore.score}</span>/100 <span class="vs-trend">${voiceScore.trend === '+' ? '↑' : voiceScore.trend === '-' ? '↓' : '→'}</span>
+    <div class="voice-score" title="${vsTooltip}">
+      <span class="vs-num">${vsDisplay}</span>/100 <span class="vs-trend">${voiceScore.score === null ? '' : (voiceScore.trend === '+' ? '↑' : voiceScore.trend === '-' ? '↓' : '→')}</span>
     </div>
   </div>
   <div class="header-right">${req.user ? '<span style="color:#4ade80">' + escapeHtml(req.user.name) + '</span> · <span>' + req.user.credits + ' credits</span> · <a href="/logout" style="color:#888;text-decoration:none">Logout</a>' : ''}</div>
@@ -3548,6 +3801,20 @@ h1{font-size:20px;margin-bottom:2px}
     <div id="liModalStatus" style="font-size:11px;color:#4ade80;margin-top:8px"></div>
   </div>
 </div>
+<!-- Thread Composer Modal -->
+<div class="li-modal" id="threadModal">
+  <div class="li-modal-box" style="max-width:600px;border-color:#7c3aed">
+    <h3 style="color:#a78bfa">Thread Composer</h3>
+    <p style="font-size:11px;color:#888;margin-bottom:10px">1. Copy Tweet 1 → post on Twitter. 2. Copy Tweet 2 → reply to Tweet 1. 3. Continue replying. Mark each as posted.</p>
+    <div id="threadProgress" style="font-size:11px;margin-bottom:8px;color:#4ade80"></div>
+    <div id="threadCards"></div>
+    <div style="margin-top:10px;display:flex;gap:6px">
+      <button class="btn btn-approve" onclick="approveThread()">Mark Thread Complete</button>
+      <button class="btn btn-reject" onclick="document.getElementById('threadModal').classList.remove('open')">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
@@ -3624,6 +3891,20 @@ function addRule(){var r=document.getElementById('newRule').value.trim();if(!r)r
 function genNewsletter(){var s=document.getElementById('genStatus');s.textContent='Assembling newsletter...';fetch('/api/newsletter/generate',{method:'POST',headers:{'Content-Type':'application/json'}}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('Newsletter generated!');s.textContent='Done — check pending.';setTimeout(function(){location.reload()},1000)}else s.textContent=d.error||'Failed'})}
 // Thread
 function genThread(){var t=document.getElementById('genTopic');var topic=t?t.value:'';var s=document.getElementById('genStatus');s.textContent='Planning thread arc...';fetch('/api/thread',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic:topic,arc_type:'contrarian'})}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('Thread generated (coherence:'+d.coherence_score+')');s.textContent='Thread ready. Reload to review.';setTimeout(function(){location.reload()},1000)}else s.textContent=d.error||'Failed'})}
+// Thread Composer
+var currentThreadId=null;
+var threadTweets=[];
+var threadPosted=[];
+function openThreadComposer(id){currentThreadId=id;fetch('/api/pending').then(r=>r.json()).then(d=>{var post=d.data.find(function(p){return p.id===id});if(!post)return showToast('Post not found');threadTweets=post.tweets||post.content.split('---').map(function(t){return t.trim()}).filter(Boolean);threadPosted=new Array(threadTweets.length).fill(false);renderThreadCards();document.getElementById('threadModal').classList.add('open')})}
+function renderThreadCards(){var h='';var done=threadPosted.filter(Boolean).length;document.getElementById('threadProgress').textContent=done+'/'+threadTweets.length+' posted';for(var i=0;i<threadTweets.length;i++){var t=threadTweets[i].replace(/^\d+\/\s*/,'');var chars=t.length;h+='<div style="background:#1a1a1a;border:1px solid '+(threadPosted[i]?'#4ade80':'#333')+';border-radius:8px;padding:10px;margin-bottom:6px">';h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span style="font-size:11px;color:#888">Tweet '+(i+1)+' of '+threadTweets.length+' ('+chars+' chars)</span>';h+='<span style="font-size:10px;color:'+(threadPosted[i]?'#4ade80':'#888')+'">'+(threadPosted[i]?'Posted ✓':'Not yet')+'</span></div>';h+='<textarea id="thread-'+i+'" style="width:100%;min-height:50px;background:#111;color:#e0e0e0;border:1px solid #333;border-radius:4px;padding:6px;font-size:12px;resize:vertical;font-family:inherit">'+t.replace(/</g,'&lt;')+'</textarea>';h+='<div style="display:flex;gap:4px;margin-top:4px"><button class="btn btn-copy" onclick="copyThreadTweet('+i+')">Copy</button><button class="btn btn-approve" onclick="markThreadPosted('+i+')">Mark Posted</button></div></div>';}document.getElementById('threadCards').innerHTML=h}
+function copyThreadTweet(i){var el=document.getElementById('thread-'+i);navigator.clipboard.writeText(el.value).then(function(){showToast('Tweet '+(i+1)+' copied!')}).catch(function(){showToast('Copy failed')})}
+function markThreadPosted(i){threadPosted[i]=true;renderThreadCards()}
+function approveThread(){if(!currentThreadId)return;fetch('/api/approve/'+currentThreadId,{method:'POST',headers:{'Content-Type':'application/json'}}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('Thread approved!');document.getElementById('threadModal').classList.remove('open');setTimeout(function(){location.reload()},500)}})}
+
+// Pending clear
+function clearAllPending(){if(!confirm('Clear ALL pending posts?'))return;fetch('/api/pending/clear-all',{method:'POST',headers:{'Content-Type':'application/json'}}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('Cleared '+d.cleared+' posts');setTimeout(function(){location.reload()},500)}})}
+function clearOldPending(){fetch('/api/pending/clear-old',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hours:24})}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('Cleared '+d.cleared+' old posts');setTimeout(function(){location.reload()},500)}})}
+
 // Generate helper updated for new platforms
 function generate(style){var s=document.getElementById('genStatus');var t=document.getElementById('genTopic');s.textContent='Generating...';fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({style:style,platform:style==='blog'?'blog':style==='email'?'email':style==='linkedin'?'linkedin':style==='reels'?'reels':'twitter',topic:t?t.value:''})}).then(function(r){return r.json()}).then(function(d){if(d.ok){s.textContent='Done!'+(d.ghost_published?' (Ghost published!)':'');showToast(d.platform+' content generated');setTimeout(function(){location.reload()},1000)}else{s.textContent=d.error||'Failed'}}).catch(function(e){s.textContent='Error: '+e.message})}
 
@@ -4083,6 +4364,45 @@ app.post('/api/inbox/bulk', actionLimiter, async (req, res) => {
   res.json({ ok: true, approved: approvedCount, skipped: skippedCount });
 });
 
+// ── Pending Queue Management (Bug: 60 posts stuck) ─────────────────────────
+app.post('/api/pending/clear-all', (req, res) => {
+  if (req.user.plan !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const pendDir = path.join(req.userDataDir, 'pending');
+  let cleared = 0;
+  try {
+    const files = fs.readdirSync(pendDir).filter(f => f.endsWith('.json'));
+    for (const f of files) { try { fs.unlinkSync(path.join(pendDir, f)); cleared++; } catch {} }
+  } catch {}
+  res.json({ ok: true, cleared });
+});
+
+app.post('/api/pending/clear-old', (req, res) => {
+  const hours = parseInt(req.body.hours) || 24;
+  const cutoff = Date.now() - hours * 3600000;
+  const pendDir = path.join(req.userDataDir, 'pending');
+  let cleared = 0;
+  try {
+    const files = fs.readdirSync(pendDir).filter(f => f.endsWith('.json'));
+    for (const f of files) {
+      try {
+        const p = JSON.parse(fs.readFileSync(path.join(pendDir, f), 'utf8'));
+        if (new Date(p.created_at).getTime() < cutoff) { fs.unlinkSync(path.join(pendDir, f)); cleared++; }
+      } catch {}
+    }
+  } catch {}
+  res.json({ ok: true, cleared, cutoff_hours: hours });
+});
+
+// Pending queue cap check (called before generation)
+function checkPendingCap(userDataDir) {
+  const pendDir = path.join(userDataDir, 'pending');
+  try {
+    const count = fs.readdirSync(pendDir).filter(f => f.endsWith('.json')).length;
+    if (count >= 20) return { capped: true, count };
+  } catch {}
+  return { capped: false };
+}
+
 // ── Calendar API ────────────────────────────────────────────────────────────
 app.get('/api/calendar', (req, res) => {
   const pubDir = path.join(req.userDataDir, 'published');
@@ -4152,7 +4472,7 @@ app.post('/api/auto-approve/:id', (req, res) => {
   fs.mkdirSync(decDir, { recursive: true });
   fs.writeFileSync(path.join(decDir, `${post.id}.json`), JSON.stringify({
     type: 'approved', auto: true, post_id: post.id, platform: post.platform,
-    format: post.format || 'unknown', content_preview: (post.content || '').slice(0, 100),
+    format: normalizeFormat(post.format), content_preview: (post.content || '').slice(0, 100),
     pillar: post.pillar, at: new Date().toISOString()
   }, null, 2));
 
