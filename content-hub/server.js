@@ -5,9 +5,55 @@ const crypto = require('crypto');
 const https = require('https');
 const http = require('http');
 const { execFile } = require('child_process');
+const rateLimit = require('express-rate-limit');
+const { MongoClient, ObjectId } = require('mongodb');
+
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// ── Startup Validation ──────────────────────────────────────────────────────
+const REQUIRED_ENV = ['GROQ_API_KEY'];
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`FATAL: ${key} is required in .env`);
+    process.exit(1);
+  }
+}
+if (!process.env.JWT_SECRET) {
+  console.warn('WARNING: JWT_SECRET not set — sessions will be lost on restart. Set JWT_SECRET in .env.');
+}
+
+// ── Rate Limiting ───────────────────────────────────────────────────────────
+const globalLimiter = rateLimit({ windowMs: 60000, max: 60, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, slow down.' } });
+const genLimiter = rateLimit({ windowMs: 60000, max: 5, standardHeaders: true, legacyHeaders: false, message: { error: 'Generation rate limit — max 5/min.' }, keyGenerator: (req) => req.userId || req.ip });
+const actionLimiter = rateLimit({ windowMs: 60000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Action rate limit — max 10/min.' } });
+app.use(globalLimiter);
+
+// ── MongoDB ─────────────────────────────────────────────────────────────────
+let db = null;
+const MONGODB_URI = process.env.MONGODB_URI;
+if (MONGODB_URI) {
+  const mongoClient = new MongoClient(MONGODB_URI, { maxPoolSize: 10 });
+  mongoClient.connect().then(() => {
+    db = mongoClient.db();
+    console.log('MongoDB connected');
+    // Create indexes
+    db.collection('users').createIndex({ email: 1 }, { unique: true }).catch(() => {});
+    db.collection('posts').createIndex({ user_id: 1, status: 1, created_at: -1 }).catch(() => {});
+    db.collection('decisions').createIndex({ user_id: 1, at: -1 }).catch(() => {});
+    db.collection('articles').createIndex({ user_id: 1, scouted_at: -1, status: 1 }).catch(() => {});
+    db.collection('stories').createIndex({ user_id: 1 }).catch(() => {});
+    db.collection('engagement').createIndex({ post_id: 1 }, { unique: true }).catch(() => {});
+    db.collection('preferences').createIndex({ user_id: 1, platform: 1 }).catch(() => {});
+    db.collection('watch_accounts').createIndex({ user_id: 1 }).catch(() => {});
+    db.collection('series').createIndex({ user_id: 1, created_at: -1 }).catch(() => {});
+  }).catch(err => {
+    console.warn('MongoDB connection failed, using file storage:', err.message);
+  });
+} else {
+  console.log('No MONGODB_URI — using file storage');
+}
 
 // ── Multi-Tenant Auth System ─────────────────────────────────────────────────
 
@@ -248,7 +294,8 @@ ${error ? '<div class="error">' + error + '</div>' : ''}
 app.post('/register', (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) return res.redirect('/register?error=All+fields+required');
-  if (password.length < 6) return res.redirect('/register?error=Password+must+be+6%2B+characters');
+  if (password.length < 8) return res.redirect('/register?error=Password+must+be+8%2B+characters');
+  if (!/[\d!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) return res.redirect('/register?error=Password+needs+a+number+or+special+character');
   if (getUserByEmail(email)) return res.redirect('/register?error=Email+already+registered');
 
   const userId = 'user-' + crypto.randomBytes(6).toString('hex');
@@ -670,11 +717,193 @@ function buildLayeredPrompt(userDataDir, pubDir, decDir, topic, platform) {
     }
   } catch {}
 
-  return identity + performance + storyLayer + antiRepeat;
+  // Layer 5: Learned preferences
+  const prefSummary = buildPreferenceSummary(userDataDir);
+
+  // Layer 6: Weekly learnings (performance layer injection)
+  let weeklyLearnings = '';
+  try {
+    const wl = JSON.parse(fs.readFileSync(path.join(userDataDir, 'state/weekly_learnings.json'), 'utf8'));
+    if (wl.learnings) weeklyLearnings = '\n\nTHIS WEEK\'S LEARNINGS (apply to this generation):\n' + wl.learnings;
+  } catch {}
+
+  return identity + performance + storyLayer + antiRepeat + prefSummary + weeklyLearnings;
 }
 
 function escapeXml(str) {
   return escapeHtml(str).replace(/'/g, '&apos;');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SPRINT 2: Voice Score, Ghost Mode, Engagement, Preferences, Image Prompts,
+//           Thread Gen, Series, Competitor Monitoring, Morning Inbox, Calendar
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Voice Score Calculation (0-100) ─────────────────────────────────────────
+
+function calculateVoiceScore(userDataDir) {
+  const decDir = path.join(userDataDir, 'decisions');
+  const pubDir = path.join(userDataDir, 'published');
+  const weekAgo = Date.now() - 7 * 86400000;
+  let totalDec = 0, approved = 0, edited = 0, rejected = 0, regens = 0;
+  try {
+    const files = fs.readdirSync(decDir).filter(f => f.endsWith('.json'));
+    for (const f of files) {
+      try {
+        const d = JSON.parse(fs.readFileSync(path.join(decDir, f), 'utf8'));
+        if (new Date(d.at).getTime() < weekAgo) continue;
+        totalDec++;
+        if (d.type === 'approved') approved++;
+        else if (d.type === 'edited') edited++;
+        else if (d.type === 'rejected') rejected++;
+        if (f.startsWith('regen-')) regens++;
+      } catch {}
+    }
+  } catch {}
+
+  // Quality gate pass rate (simulated from approval rate)
+  const gateScore = totalDec > 0 ? Math.round((approved / totalDec) * 100) : 50;
+  // Approval without edits
+  const approvalScore = totalDec > 0 ? Math.round(((approved) / Math.max(approved + edited + rejected, 1)) * 100) : 50;
+  // Regen frequency (lower = better)
+  const regenScore = totalDec > 0 ? Math.max(0, Math.round(100 - (regens / totalDec) * 200)) : 50;
+  // Story count bonus
+  const stories = loadStories(userDataDir);
+  const storyBonus = Math.min(stories.length * 4, 20);
+
+  // Weighted composite
+  const score = Math.min(100, Math.round(gateScore * 0.25 + approvalScore * 0.35 + regenScore * 0.20 + storyBonus + 10));
+  const trend = approvalScore > 60 ? '+' : (approvalScore < 40 ? '-' : '=');
+  return { score, trend, breakdown: { gate_pass: gateScore, approval_clean: approvalScore, regen_rate: regenScore, story_bonus: storyBonus } };
+}
+
+// ── Ghost Mode Logic ────────────────────────────────────────────────────────
+
+function getGhostModeSettings(userDataDir) {
+  const file = path.join(userDataDir, 'state/ghost_mode.json');
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return { enabled: false, platforms: { twitter: false }, threshold: 8, posts: [] }; }
+}
+
+function saveGhostModeSettings(userDataDir, settings) {
+  const stateDir = path.join(userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'ghost_mode.json'), JSON.stringify(settings, null, 2));
+}
+
+// ── Preference Model (Regen Memory Overhaul) ────────────────────────────────
+
+const FEEDBACK_CATEGORIES = ['LENGTH', 'TONE', 'SPECIFICITY', 'ANGLE', 'STYLE', 'FORMAT'];
+
+function loadPreferences(userDataDir) {
+  const file = path.join(userDataDir, 'state/preferences.json');
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return { twitter: {}, linkedin: {}, reels: {}, threads: {}, rules: [] }; }
+}
+
+function savePreferences(userDataDir, prefs) {
+  const stateDir = path.join(userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'preferences.json'), JSON.stringify(prefs, null, 2));
+}
+
+function buildPreferenceSummary(userDataDir) {
+  const prefs = loadPreferences(userDataDir);
+  let summary = '';
+  for (const platform of ['twitter', 'linkedin', 'reels']) {
+    const pf = prefs[platform] || {};
+    const parts = Object.entries(pf).filter(([, v]) => v).map(([k, v]) => k + ': ' + v);
+    if (parts.length > 0) summary += '\n' + platform.toUpperCase() + ' preferences: ' + parts.join(', ');
+  }
+  if (prefs.rules && prefs.rules.length > 0) {
+    summary += '\nPERMANENT RULES: ' + prefs.rules.join('; ');
+  }
+  return summary ? '\n\nLEARNED USER PREFERENCES:' + summary : '';
+}
+
+// ── Image Prompt Generation ─────────────────────────────────────────────────
+
+function generateImagePrompt(content, platform) {
+  const emotions = { anger: 'dark, contrasty, moody', hope: 'bright, open, warm light', superiority: 'clean, minimal, confident', fear: 'dramatic, shadows, urgency' };
+  const formats = { twitter: '1:1 square', linkedin: '1.91:1 landscape', reels: '9:16 vertical', blog: '16:9 hero' };
+  const aesthetics = { twitter: 'bold typography or candid photography', linkedin: 'professional editorial', reels: 'high contrast vertical with bold colour', blog: 'clean editorial with depth' };
+
+  const firstLine = (content || '').split('\n')[0].toLowerCase();
+  let detectedEmotion = 'superiority';
+  if (/nobody|broken|wrong|fail|stop/.test(firstLine)) detectedEmotion = 'anger';
+  else if (/will|future|next|coming|soon/.test(firstLine)) detectedEmotion = 'hope';
+  else if (/miss|left behind|late|behind/.test(firstLine)) detectedEmotion = 'fear';
+
+  const subject = (content || '').split('\n')[0].slice(0, 60);
+  return `[${formats[platform] || '1:1'}] ${aesthetics[platform] || 'editorial'}, ${emotions[detectedEmotion]}, subject: "${subject}", --no text overlay, --no stock photo feel, --no generic corporate imagery`;
+}
+
+// ── Engagement Data Helpers ─────────────────────────────────────────────────
+
+async function fetchTwitterEngagement(tweetId) {
+  const bearer = process.env.TWITTER_BEARER_TOKEN;
+  if (!bearer || !tweetId) return null;
+  return new Promise((resolve) => {
+    const url = `https://api.twitter.com/2/tweets/${tweetId}?tweet.fields=public_metrics`;
+    https.get(url, { headers: { 'Authorization': 'Bearer ' + bearer } }, (res2) => {
+      let d = ''; res2.on('data', c => d += c); res2.on('end', () => {
+        try {
+          const data = JSON.parse(d);
+          const m = data.data?.public_metrics;
+          if (m) {
+            const engRate = m.impression_count > 0 ? ((m.like_count + m.reply_count + m.retweet_count) / m.impression_count * 100).toFixed(2) : 0;
+            resolve({ impressions: m.impression_count, likes: m.like_count, replies: m.reply_count, retweets: m.retweet_count, engagement_rate: parseFloat(engRate) });
+          } else resolve(null);
+        } catch { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
+
+// ── Watch Accounts (Competitor Monitoring) ──────────────────────────────────
+
+function loadWatchAccounts(userDataDir) {
+  const file = path.join(userDataDir, 'state/watch_accounts.json');
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return { accounts: [] }; }
+}
+
+function saveWatchAccounts(userDataDir, data) {
+  const stateDir = path.join(userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'watch_accounts.json'), JSON.stringify(data, null, 2));
+}
+
+// ── Series Planner ──────────────────────────────────────────────────────────
+
+function loadSeries(userDataDir) {
+  const file = path.join(userDataDir, 'state/series.json');
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return []; }
+}
+
+function saveSeries(userDataDir, series) {
+  const stateDir = path.join(userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'series.json'), JSON.stringify(series, null, 2));
+}
+
+// ── Morning Inbox / Package ─────────────────────────────────────────────────
+
+function getTodayPackage(userDataDir) {
+  const file = path.join(userDataDir, 'state/inbox_today.json');
+  const today = new Date().toISOString().slice(0, 10);
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (data.date === today) return data;
+  } catch {}
+  return null;
+}
+
+function saveTodayPackage(userDataDir, pkg) {
+  const stateDir = path.join(userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'inbox_today.json'), JSON.stringify(pkg, null, 2));
 }
 
 // ── API: Publish (auto-publish from n8n) — TENANT-SCOPED ─────────────────────
@@ -852,7 +1081,7 @@ app.post('/api/whatsapp-command', async (req, res) => {
   const cmd = (text || '').trim().toLowerCase();
   const pending = readJsonDir(pendDir);
 
-  if (!cmd) return res.json({ reply: 'Commands: LIST, SKIP, ALL, STATS, TRUST 0/1/2, PAUSE, RESUME, POST ABOUT <topic>, BRIEF, DIGEST, or send a number to approve.' });
+  if (!cmd) return res.json({ reply: 'Commands: LIST, SKIP, ALL, STATS, STATUS, TRUST, PAUSE, RESUME, POST ABOUT, BRIEF, DIGEST, STORIES, SERIES, UNDO, or numbers (1 2 4) to approve / SKIP 3 5 to skip.' });
 
   // LIST pending
   if (cmd === 'list' || cmd === 'pending') {
@@ -997,6 +1226,91 @@ app.post('/api/whatsapp-command', async (req, res) => {
     return res.json({ reply: `Cancelled: [${lastAuto.platform}] ${(lastAuto.content || '').slice(0, 80)}` });
   }
 
+  // STATUS command — package status, week stats, trust levels
+  if (cmd === 'status') {
+    const published = readJsonDir(pubDir);
+    const weekAgo = new Date(Date.now() - 7 * 86400000);
+    const thisWeek = published.filter(p => new Date(p.published_at) >= weekAgo);
+    const byPlatform = {};
+    for (const p of thisWeek) byPlatform[p.platform] = (byPlatform[p.platform] || 0) + 1;
+    const platformStr = Object.entries(byPlatform).map(([k, v]) => k + ':' + v).join(', ') || 'none';
+    let trustStr = '';
+    try { const t = JSON.parse(fs.readFileSync(path.join(stateDir, 'trust.json'), 'utf8')); trustStr = Object.entries(t.per_channel_trust || {}).map(([k, v]) => k + ':' + v).join(', '); } catch {}
+    return res.json({ reply: `📊 Status:\nPending: ${pending.length}\nThis week: ${thisWeek.length} (${platformStr})\nTrust: ${trustStr || 'not set'}\nLast post: ${published[0] ? new Date(published[0].published_at).toLocaleString('en-IN') : 'none'}` });
+  }
+
+  // UNDO — ghost mode undo within 1hr
+  if (cmd === 'undo') {
+    const ghost = getGhostModeSettings(req.userDataDir);
+    const recent = (ghost.posts || []).find(p => Date.now() - new Date(p.posted_at).getTime() < 3600000);
+    if (!recent) return res.json({ reply: 'No ghost-posted content within the last hour to undo.' });
+    // Delete from published
+    try { fs.unlinkSync(path.join(pubDir, recent.id + '.json')); } catch {}
+    return res.json({ reply: `Undone: "${(recent.content_preview || '').slice(0, 60)}..."` });
+  }
+
+  // ADD STORY: <event> / <lesson>
+  if (cmd.startsWith('add story:') || cmd.startsWith('story:')) {
+    const storyText = text.trim().replace(/^(add )?story:\s*/i, '');
+    const parts = storyText.split('/').map(s => s.trim());
+    const story = parts[0];
+    const lesson = parts[1] || '';
+    if (!story) return res.json({ reply: 'Usage: ADD STORY: what happened / lesson learned' });
+    const stories = loadStories(req.userDataDir);
+    const newStory = { id: generateId(), story, lesson, tags: [], added_at: new Date().toISOString() };
+    stories.push(newStory);
+    saveStoriesFile(req.userDataDir, stories);
+    return res.json({ reply: `Story added (${stories.length} total): "${story.slice(0, 60)}..."` });
+  }
+
+  // SERIES: <topic>
+  if (cmd.startsWith('series:') || cmd.startsWith('series ')) {
+    const seriesTopic = text.trim().replace(/^series[:\s]+/i, '');
+    if (!seriesTopic) return res.json({ reply: 'Usage: SERIES: <topic>' });
+    try {
+      const ctx = buildLayeredPrompt(req.userDataDir, pubDir, decDir, seriesTopic, 'twitter');
+      const raw = await callGroq(ctx, 'Plan a 5-day content series on "' + seriesTopic + '". Return JSON: {"title":"...","days":[{"day":1,"theme":"...","angle":"..."},...]}', { temperature: 0.8, max_tokens: 600 });
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (m) {
+        const plan = JSON.parse(m[0]);
+        const series = loadSeries(req.userDataDir);
+        plan.id = generateId(); plan.topic = seriesTopic; plan.created_at = new Date().toISOString(); plan.status = 'planned';
+        series.unshift(plan);
+        saveSeries(req.userDataDir, series);
+        const dayList = (plan.days || []).map(d => `Day ${d.day}: ${d.theme}`).join('\n');
+        return res.json({ reply: `📚 Series planned: "${plan.title}"\n\n${dayList}\n\nOpen dashboard to generate posts.` });
+      }
+    } catch {}
+    return res.json({ reply: 'Failed to plan series. Try again.' });
+  }
+
+  // ALWAYS <rule> — permanent preference rule
+  if (cmd.startsWith('always ') || cmd.startsWith('never ')) {
+    const rule = text.trim();
+    const prefs = loadPreferences(req.userDataDir);
+    prefs.rules = prefs.rules || [];
+    prefs.rules.push(rule);
+    savePreferences(req.userDataDir, prefs);
+    return res.json({ reply: `Got it, I'll remember: "${rule}" for all future posts.` });
+  }
+
+  // REGEN <number> <instruction> — targeted regen
+  const regenMatch = cmd.match(/^regen\s+(\d+)\s+(.+)/);
+  if (regenMatch) {
+    const idx = parseInt(regenMatch[1]) - 1;
+    if (idx < 0 || idx >= pending.length) return res.json({ reply: `No pending post #${idx + 1}.` });
+    const post = pending[idx];
+    const instruction = text.trim().slice(regenMatch[0].indexOf(regenMatch[2]));
+    try {
+      const ctx = buildLayeredPrompt(req.userDataDir, pubDir, decDir, post.pillar, post.platform);
+      const newContent = await callGroq(ctx, 'Rewrite this post with instruction: "' + instruction + '"\n\nOriginal: "' + post.content + '"\n\nReturn ONLY the new post text.', { temperature: 0.8, max_tokens: 400 });
+      post.content = newContent;
+      post.regenerated = true;
+      fs.writeFileSync(path.join(pendDir, post.id + '.json'), JSON.stringify(post, null, 2));
+      return res.json({ reply: `Regenerated #${idx + 1}:\n${newContent.slice(0, 200)}` });
+    } catch { return res.json({ reply: 'Regen failed. Try again.' }); }
+  }
+
   // EDIT <number> <new text>
   const editMatch = cmd.match(/^edit\s+(\d+)\s+(.+)/);
   if (editMatch) {
@@ -1009,20 +1323,40 @@ app.post('/api/whatsapp-command', async (req, res) => {
     return res.json({ reply: `Edited #${idx + 1}. Send ${idx + 1} to approve or LIST to review.` });
   }
 
-  // Approve by number
-  const num = parseInt(cmd);
-  if (!isNaN(num) && num >= 1 && num <= pending.length) {
-    const post = pending[num - 1];
-    post.published_at = new Date().toISOString();
-    post.status = 'published';
-    delete post.created_at;
-    fs.writeFileSync(path.join(pubDir, `${post.id}.json`), JSON.stringify(post, null, 2));
-    try { fs.unlinkSync(path.join(pendDir, `${post.id}.json`)); } catch {}
-    const preview = (post.content || '').slice(0, 100);
-    return res.json({ reply: `Approved #${num} [${post.platform}]:\n${preview}` });
+  // SKIP <numbers> — skip specific items
+  const skipMatch = cmd.match(/^skip\s+([\d\s]+)/);
+  if (skipMatch && skipMatch[1].trim() !== '') {
+    const nums = skipMatch[1].trim().split(/\s+/).map(Number).filter(n => n >= 1 && n <= pending.length);
+    let skipped = 0;
+    for (const n of nums) {
+      const post = pending[n - 1];
+      if (post) { try { fs.unlinkSync(path.join(pendDir, post.id + '.json')); skipped++; } catch {} }
+    }
+    return res.json({ reply: `Skipped ${skipped} item(s): ${nums.join(', ')}` });
   }
 
-  return res.json({ reply: `Commands: LIST, SKIP, ALL, STATS, TRUST 0/1/2, PAUSE, RESUME, POST ABOUT <topic>, BRIEF, DIGEST, CANCEL, EDIT <n> <text>, or number to approve.` });
+  // Approve by number(s) — "1 2 4" approves items 1, 2, and 4
+  const nums = cmd.split(/\s+/).map(Number).filter(n => !isNaN(n) && n >= 1 && n <= pending.length);
+  if (nums.length > 0) {
+    let approved = 0;
+    const previews = [];
+    for (const num of nums) {
+      const post = pending[num - 1];
+      if (!post) continue;
+      post.published_at = new Date().toISOString();
+      post.status = 'published';
+      delete post.created_at;
+      fs.writeFileSync(path.join(pubDir, `${post.id}.json`), JSON.stringify(post, null, 2));
+      try { fs.unlinkSync(path.join(pendDir, `${post.id}.json`)); } catch {}
+      fs.mkdirSync(decDir, { recursive: true });
+      fs.writeFileSync(path.join(decDir, post.id + '.json'), JSON.stringify({ type: 'approved', post_id: post.id, platform: post.platform, at: new Date().toISOString() }, null, 2));
+      previews.push(`✅ #${num} [${post.platform}]: ${(post.content || '').slice(0, 60)}`);
+      approved++;
+    }
+    return res.json({ reply: `Approved ${approved}:\n${previews.join('\n')}` });
+  }
+
+  return res.json({ reply: `Commands: LIST, SKIP <n>, ALL, STATS, STATUS, TRUST, PAUSE, RESUME, POST ABOUT, BRIEF, DIGEST, CANCEL, UNDO, EDIT <n>, REGEN <n>, ADD STORY:, SERIES:, ALWAYS/NEVER, or numbers to approve.` });
 });
 
 // ── API: Schedule a pending post — TENANT-SCOPED ─────────────────────────────
@@ -1476,7 +1810,7 @@ app.post('/api/regenerate/:id', async (req, res) => {
 
 // ── API: Generate Insight — TENANT-SCOPED ────────────────────────────────────
 
-app.post('/api/insight', async (req, res) => {
+app.post('/api/insight', genLimiter, async (req, res) => {
   if (req.user && req.user.plan !== 'admin') {
     const credit = deductCredit(req.userId);
     if (!credit.ok) return res.status(402).json({ error: credit.error });
@@ -1615,9 +1949,45 @@ app.post('/api/insight', async (req, res) => {
       }, null, 2));
     }
 
-    notify('New insight generated', 'Tweet + Thread + LinkedIn + Reels from one idea');
+    // Generate blog post from insight
+    const blogId = generateId();
+    try {
+      const blogContent = await callGroq(layeredContext + '\n\nYou write long-form blog posts. 800-1500 words. Hook paragraph → 3 story-anchored sections → contrarian take → CTA.',
+        'Write a blog post from this insight: "' + insight.insight + '"\nUse stories from context. 800-1500 words. Return ONLY the post text.',
+        { temperature: 0.7, max_tokens: 2500 });
+      if (blogContent && blogContent.length > 200) {
+        fs.writeFileSync(path.join(pendDir, blogId + '.json'), JSON.stringify({
+          id: blogId, platform: 'blog', content: blogContent, pillar: insight.angle || 'insight',
+          format: 'blog_post', image_prompt: generateImagePrompt(blogContent, 'blog'),
+          created_at: new Date().toISOString(), status: 'pending'
+        }, null, 2));
+      }
+    } catch {}
 
-    res.json({ ok: true, insight });
+    // Generate email newsletter section
+    const emailId = generateId();
+    try {
+      const emailContent = await callGroq(layeredContext + '\n\nYou write newsletter sections. 150-250 words. Personal opener + insight + story + CTA.',
+        'Write a newsletter section from: "' + insight.insight + '"\nReturn JSON: {"subject_line":"...","preview_text":"under 90 chars","body":"150-250 words","sign_off":"..."}',
+        { temperature: 0.7, max_tokens: 500 });
+      const emailMatch = emailContent.match(/\{[\s\S]*\}/);
+      if (emailMatch) {
+        const email = JSON.parse(emailMatch[0]);
+        fs.writeFileSync(path.join(pendDir, emailId + '.json'), JSON.stringify({
+          id: emailId, platform: 'email', content: email.body, subject_line: email.subject_line,
+          preview_text: email.preview_text, format: 'newsletter_section',
+          created_at: new Date().toISOString(), status: 'pending'
+        }, null, 2));
+      }
+    } catch {}
+
+    // Add image prompts to tweet
+    const tweetImagePrompt = generateImagePrompt(insight.tweet || '', 'twitter');
+    const liImagePrompt = generateImagePrompt(insight.linkedin_angle || '', 'linkedin');
+
+    notify('New insight generated', 'Tweet + Thread + LinkedIn + Reels + Blog + Email from one idea');
+
+    res.json({ ok: true, insight, image_prompts: { twitter: tweetImagePrompt, linkedin: liImagePrompt } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1625,7 +1995,7 @@ app.post('/api/insight', async (req, res) => {
 
 // ── API: Generate on demand — TENANT-SCOPED ──────────────────────────────────
 
-app.post('/api/generate', async (req, res) => {
+app.post('/api/generate', genLimiter, async (req, res) => {
   if (req.user && req.user.plan !== 'admin') {
     const credit = deductCredit(req.userId);
     if (!credit.ok) return res.status(402).json({ error: credit.error });
@@ -1740,28 +2110,56 @@ app.post('/api/generate', async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 
+  // Blog generation
+  if (targetPlatform === 'blog') {
+    try {
+      finalContent = await callGroq(sysPrompt + '\n\nYou write long-form blog posts. 800-1500 words.',
+        (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') + 'Write a blog post. Hook paragraph → 3 story-anchored sections → contrarian take → CTA. 800-1500 words. Return ONLY the text.',
+        { temperature: 0.7, max_tokens: 2500 });
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  }
+
+  // Email generation
+  if (targetPlatform === 'email') {
+    try {
+      const raw = await callGroq(sysPrompt + '\n\nYou write newsletter sections.',
+        (briefTopic ? 'Topic: ' + briefTopic + '\n\n' : '') + 'Write a newsletter section: subject line, preview text, body (150-250 words), sign-off. Return JSON: {"subject_line":"...","preview_text":"...","body":"..."}',
+        { temperature: 0.7, max_tokens: 500 });
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (m) { const e = JSON.parse(m[0]); finalContent = e.body; } else finalContent = raw;
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  }
+
   const id = generateId();
+  const imagePrompt = generateImagePrompt(finalContent, actualPlatform);
   const post = {
     id,
     profile_id: 'deep_personal',
     display_name: 'Deep – Personal',
-    platform: actualPlatform,
+    platform: ['blog', 'email'].includes(targetPlatform) ? targetPlatform : actualPlatform,
     content: finalContent,
     content_full: { tweet: finalContent },
     pillar: briefTopic || 'On Demand',
-    format: isReels ? 'reels_script' : (isLinkedIn ? 'linkedin_post' : chosenStyle),
+    format: isReels ? 'reels_script' : (isLinkedIn ? 'linkedin_post' : (['blog', 'email'].includes(targetPlatform) ? targetPlatform + '_post' : chosenStyle)),
+    image_prompt: imagePrompt,
     created_at: new Date().toISOString(),
     status: 'pending'
   };
   fs.writeFileSync(path.join(pendDir, `${id}.json`), JSON.stringify(post, null, 2));
 
-  notify('New content generated', actualPlatform + ' post ready for review');
-  res.json({ ok: true, id, content: finalContent, platform: actualPlatform, style: chosenStyle });
+  // Ghost Mode check (auto-publish if score high enough)
+  let ghostPublished = false;
+  if (post.platform === 'twitter') {
+    ghostPublished = await ghostModeCheck(req.userDataDir, post);
+  }
+
+  if (!ghostPublished) notify('New content generated', (post.platform) + ' post ready for review');
+  res.json({ ok: true, id, content: finalContent, platform: post.platform, style: chosenStyle, image_prompt: imagePrompt, ghost_published: ghostPublished });
 });
 
 // ── API: Article Scout — TENANT-SCOPED ───────────────────────────────────────
 
-app.post('/api/scout', async (req, res) => {
+app.post('/api/scout', genLimiter, async (req, res) => {
   const GROQ_KEY = process.env.GROQ_API_KEY;
   if (!GROQ_KEY) return res.status(500).json({ error: 'No GROQ_API_KEY' });
 
@@ -2637,11 +3035,21 @@ app.get('/dashboard', (req, res) => {
 
   const onboardingDone = isOnboardingComplete(req.userDataDir);
 
+  // Sprint 2 data
+  const voiceScore = calculateVoiceScore(req.userDataDir);
+  const ghostMode = getGhostModeSettings(req.userDataDir);
+  const watchAccounts = loadWatchAccounts(req.userDataDir);
+  const userSeries = loadSeries(req.userDataDir);
+  const userPrefs = loadPreferences(req.userDataDir);
+  const todayPackage = getTodayPackage(req.userDataDir);
+
   const counts = {
     feed: articles.length,
     twitter: allPending.filter(p => p.platform === 'twitter').length + allPosts.filter(p => p.platform === 'twitter').length,
     linkedin: allPending.filter(p => p.platform === 'linkedin').length + allPosts.filter(p => p.platform === 'linkedin').length,
     reels: allPending.filter(p => p.platform === 'reels').length + allPosts.filter(p => p.platform === 'reels').length,
+    blog: allPending.filter(p => p.platform === 'blog').length + allPosts.filter(p => p.platform === 'blog').length,
+    email: allPending.filter(p => p.platform === 'email').length + allPosts.filter(p => p.platform === 'email').length,
     approved: allPosts.length,
     stories: userStories.length
   };
@@ -2724,9 +3132,11 @@ app.get('/dashboard', (req, res) => {
       + (p.format ? '<span class="tag tag-format">' + esc(p.format) + '</span>' : '')
       + (p.pillar ? '<span class="tag">' + esc(p.pillar) + '</span>' : '')
       + (!isPending && p.published_at ? '<span>' + new Date(p.published_at).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + '</span>' : '')
+      + (p.ghost_mode ? '<span class="ghost-badge">👻 Ghost</span>' : '')
       + '</div>'
       + '<div class="post-text" id="text-' + p.id + '">' + esc(content) + '</div>'
       + '<textarea class="edit-area" id="edit-' + p.id + '" style="display:none">' + esc(content) + '</textarea>'
+      + (p.image_prompt ? '<div class="img-prompt" onclick="copyText(\'' + esc(p.image_prompt).replace(/'/g, '&#39;') + '\',this)" title="Click to copy image prompt">' + esc(p.image_prompt) + '</div>' : '')
       + actions
       + '</div>';
   }
@@ -2828,6 +3238,7 @@ app.get('/dashboard', (req, res) => {
         + '<button class="gen-style" onclick="generate(\'provocation\')">Provocation</button>'
         + '<button class="gen-style" onclick="generate(\'raw_take\')">Raw Take</button>'
         + '<button class="gen-style" onclick="generate(\'prediction\')">Prediction</button>'
+        + '<button class="gen-style" onclick="genThread()" style="background:#7c3aed;color:#e9d5ff">Thread</button>'
         + '<input type="text" id="genTopic" placeholder="Topic (optional)..." class="gen-input-sm" />'
         + '<div class="gen-status" id="genStatus"></div></div>';
       if (trendingDiscussions.length > 0) {
@@ -2895,6 +3306,37 @@ app.get('/dashboard', (req, res) => {
       + '</div></div>';
   }
 
+  // Calendar tab
+  if (tab === 'calendar') {
+    tabContent = '<div class="section" style="border-color:#334155"><div class="section-header"><h2>Content Calendar (7-day)</h2></div>'
+      + '<div id="calGrid" class="cal-grid">Loading...</div>'
+      + '<div id="calStats" style="font-size:11px;color:#888;margin-top:6px"></div></div>'
+      + '<script>fetch("/api/calendar").then(r=>r.json()).then(d=>{var h="";for(var i=0;i<d.days.length;i++){var day=d.days[i];h+=\'<div class="cal-day\'+(day.isToday?\' today\':\'\')+\'"><div class="cal-day-label">\'+day.label+\'</div>\';for(var j=0;j<day.posts.length;j++){var p=day.posts[j];h+=\'<div class="cal-post \'+(p.status==="published"?"pub":p.status==="scheduled"?"sched":"pend")+\'">\'+p.platform+\': \'+p.content_preview.slice(0,30)+\'</div>\';}if(day.posts.length===0)h+=\'<div style="color:#555;font-size:9px">empty</div>\';h+=\'</div>\';}document.getElementById("calGrid").innerHTML=h;document.getElementById("calStats").textContent="This week: "+d.stats.total+" posted, "+d.stats.pending+" pending, platforms: "+d.stats.platforms.join(", ");})</script>';
+  }
+
+  // Blog tab
+  if (tab === 'blog') {
+    var blogPending = allPending.filter(function(p){ return p.platform === 'blog'; });
+    var blogApproved = allPosts.filter(function(p){ return p.platform === 'blog'; }).slice(0, 10);
+    tabContent = '<div class="gen-bar"><button class="gen-style" onclick="generate(\'blog\')">Generate Blog Post</button>'
+      + '<input type="text" id="genTopic" placeholder="Topic..." class="gen-input-sm" /><div class="gen-status" id="genStatus"></div></div>';
+    if (blogPending.length > 0) tabContent += '<div class="section section-pending"><h2>Pending</h2>' + blogPending.map(function(p){ return renderPost(p, true); }).join('') + '</div>';
+    if (blogApproved.length > 0) tabContent += '<div class="section"><h2>Published</h2>' + blogApproved.map(function(p){ return renderPost(p, false); }).join('') + '</div>';
+    if (blogPending.length === 0 && blogApproved.length === 0) tabContent += '<div class="section"><div class="empty">No blog posts yet. Generate one above.</div></div>';
+  }
+
+  // Email tab
+  if (tab === 'email') {
+    var emailPending = allPending.filter(function(p){ return p.platform === 'email'; });
+    var emailApproved = allPosts.filter(function(p){ return p.platform === 'email'; }).slice(0, 10);
+    tabContent = '<div class="gen-bar"><button class="gen-style" onclick="generate(\'email\')">Generate Email Section</button>'
+      + '<button class="gen-style" onclick="genNewsletter()" style="background:#7c2d12;color:#fb923c">Weekly Newsletter</button>'
+      + '<input type="text" id="genTopic" placeholder="Topic..." class="gen-input-sm" /><div class="gen-status" id="genStatus"></div></div>';
+    if (emailPending.length > 0) tabContent += '<div class="section section-pending"><h2>Pending</h2>' + emailPending.map(function(p){ return renderPost(p, true); }).join('') + '</div>';
+    if (emailApproved.length > 0) tabContent += '<div class="section"><h2>Sent</h2>' + emailApproved.map(function(p){ return renderPost(p, false); }).join('') + '</div>';
+    if (emailPending.length === 0 && emailApproved.length === 0) tabContent += '<div class="section"><div class="empty">No email content yet.</div></div>';
+  }
+
   // Settings tab
   if (tab === 'settings') {
     const pct = trustSettings.per_channel_trust || {};
@@ -2916,6 +3358,38 @@ app.get('/dashboard', (req, res) => {
       + '</table>'
       + '<div id="trustStatus" style="font-size:11px;color:#4ade80;margin-top:8px"></div>'
       + '</div>'
+
+      // Ghost Mode section
+      + '<div class="section" style="border-color:#7c3aed">'
+      + '<div class="section-header"><h2 style="color:#a78bfa">👻 Ghost Mode</h2></div>'
+      + '<p style="font-size:12px;color:#888;margin-bottom:8px">Twitter-only. Posts scoring ≥' + (ghostMode.threshold || 8) + ' AHA auto-publish without approval.</p>'
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer">'
+      + '<input type="checkbox" id="ghostToggle" ' + ((ghostMode.enabled || (ghostMode.platforms||{}).twitter) ? 'checked' : '') + ' onchange="toggleGhost(this.checked)" style="width:16px;height:16px">'
+      + ' Enable Ghost Mode for Twitter</label>'
+      + '<div style="margin-top:8px;font-size:11px;color:#888">'
+      + '<label>AHA threshold: <select id="ghostThreshold" onchange="setGhostThreshold(this.value)" style="background:#1a1a1a;border:1px solid #333;color:#e0e0e0;padding:2px;border-radius:3px;font-size:11px">'
+      + [7,8,9,10].map(function(n){ return '<option value="'+n+'"'+(n===(ghostMode.threshold||8)?' selected':'')+'>'+n+'</option>'; }).join('')
+      + '</select></label></div>'
+      + (ghostMode.posts && ghostMode.posts.length > 0 ? '<div style="margin-top:8px;font-size:11px"><b>Recent ghost posts:</b>' + ghostMode.posts.slice(0,3).map(function(p){ return '<div style="color:#a78bfa;margin-top:3px">AHA:'+p.aha_score+' "'+esc(p.content_preview||'')+'"</div>'; }).join('') + '</div>' : '')
+      + '</div>'
+
+      // Watch Accounts section
+      + '<div class="section">'
+      + '<div class="section-header"><h2>Watch Accounts</h2></div>'
+      + '<p style="font-size:12px;color:#888;margin-bottom:8px">Monitor Twitter accounts in your space for competitor signals.</p>'
+      + '<div style="display:flex;gap:4px;margin-bottom:8px"><input id="newWatch" class="gen-input" placeholder="@username" style="flex:1"><button class="btn btn-approve" onclick="addWatch()">Add</button><button class="btn btn-edit" onclick="scanWatch()">Scan Now</button></div>'
+      + '<div id="watchList">' + (watchAccounts.accounts || []).map(function(a){ return '<div style="font-size:11px;padding:3px 0;border-bottom:1px solid #222">@'+esc(a.username)+' <button class="btn btn-reject" style="font-size:9px;padding:1px 5px" onclick="removeWatch(\''+a.username+'\')">×</button></div>'; }).join('') + '</div>'
+      + '<div id="watchStatus" style="font-size:11px;color:#4ade80;margin-top:5px"></div>'
+      + '</div>'
+
+      // Preferences section
+      + '<div class="section">'
+      + '<h2>Learned Preferences</h2>'
+      + '<div style="font-size:12px;color:#888;margin-bottom:8px">' + (userPrefs.rules && userPrefs.rules.length > 0 ? '<b>Rules:</b> ' + userPrefs.rules.map(function(r){ return esc(r); }).join('; ') : 'No permanent rules set. Use "ALWAYS..." or "NEVER..." in WhatsApp to add.') + '</div>'
+      + '<div style="display:flex;gap:4px"><input id="newRule" class="gen-input" placeholder="e.g. always add India angle to Twitter" style="flex:1"><button class="btn btn-approve" onclick="addRule()">Add Rule</button></div>'
+      + '<div id="ruleStatus" style="font-size:11px;color:#4ade80;margin-top:5px"></div>'
+      + '</div>'
+
       + '<div class="section">'
       + '<h2>Onboarding Status</h2>'
       + '<p style="font-size:12px;color:#888;margin-bottom:8px">'
@@ -2926,6 +3400,7 @@ app.get('/dashboard', (req, res) => {
       + '</div>';
   }
 
+  const vsColor = voiceScore.score >= 71 ? '#4ade80' : (voiceScore.score >= 41 ? '#facc15' : '#f87171');
   const html = `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2938,7 +3413,10 @@ h1{font-size:20px;margin-bottom:2px}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
 .header-right{font-size:11px;color:#888}
 .header-right .approved{color:#4ade80} .header-right .rejected{color:#f87171}
-.tabs{display:flex;gap:0;margin-bottom:14px;border-radius:8px;overflow:hidden;border:1px solid #333}
+.voice-score{display:inline-flex;align-items:center;gap:4px;background:#161616;border:1px solid ${vsColor};border-radius:20px;padding:3px 10px;font-size:12px;font-weight:600;color:${vsColor}}
+.voice-score .vs-num{font-size:16px}
+.voice-score .vs-trend{font-size:10px;opacity:.7}
+.tabs{display:flex;gap:0;margin-bottom:14px;border-radius:8px;overflow:hidden;border:1px solid #333;flex-wrap:wrap}
 .tab{flex:1;padding:9px 0;text-align:center;font-size:12px;font-weight:500;cursor:pointer;text-decoration:none;color:#888;background:#161616;border-right:1px solid #333;transition:all .15s}
 .tab:last-child{border-right:none}
 .tab:hover{background:#1e293b;color:#e0e0e0}
@@ -2987,6 +3465,24 @@ h1{font-size:20px;margin-bottom:2px}
 .li-modal-btns{display:flex;gap:8px;flex-wrap:wrap}
 .toast{position:fixed;bottom:20px;right:20px;background:#1e293b;border:1px solid #4ade80;color:#4ade80;padding:10px 16px;border-radius:8px;font-size:12px;z-index:9999;opacity:0;transition:opacity .3s;pointer-events:none}
 .toast.show{opacity:1}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;margin-bottom:12px}
+.cal-day{background:#161616;border:1px solid #2a2a2a;border-radius:6px;padding:6px;min-height:80px;font-size:10px}
+.cal-day.today{border-color:#4ade80}
+.cal-day-label{font-weight:600;margin-bottom:4px;font-size:11px}
+.cal-post{background:#1a1a1a;border:1px solid #333;border-radius:3px;padding:2px 4px;margin-bottom:2px;font-size:9px;cursor:pointer}
+.cal-post.pub{border-left:2px solid #4ade80}
+.cal-post.sched{border-left:2px solid #facc15}
+.cal-post.pend{border-left:2px solid #888}
+.inbox-pkg{background:#161616;border:2px solid #7c3aed;border-radius:10px;padding:14px;margin-bottom:12px}
+.inbox-item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #2a2a2a;font-size:12px}
+.inbox-item:last-child{border-bottom:none}
+.inbox-check{width:16px;height:16px;cursor:pointer}
+.img-prompt{background:#1e1e2e;border:1px solid #444;border-radius:5px;padding:6px 8px;font-size:10px;color:#a78bfa;margin-top:4px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.variation-set{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-bottom:8px}
+.var-card{background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:10px;cursor:pointer;transition:border-color .2s}
+.var-card:hover{border-color:#4ade80}
+.var-card.selected{border-color:#4ade80;border-width:2px}
+.ghost-badge{background:#7c3aed;color:#fff;padding:1px 5px;border-radius:3px;font-size:9px;margin-left:4px}
 .sched-btn:hover{background:#334155;border-color:#facc15}
 .btn-regen{background:#1e293b;color:#c084fc}.btn-regen:hover{background:#334155}
 .regen-box{display:flex;gap:4px;margin-top:5px;align-items:center}
@@ -3016,7 +3512,12 @@ h1{font-size:20px;margin-bottom:2px}
 .links a:hover{background:#1e293b}
 </style></head><body>
 <div class="header">
-  <h1>Content Machine</h1>
+  <div>
+    <h1>Content Machine</h1>
+    <div class="voice-score" title="Gate:${voiceScore.breakdown.gate_pass} Approval:${voiceScore.breakdown.approval_clean} Regen:${voiceScore.breakdown.regen_rate} Stories:${voiceScore.breakdown.story_bonus}">
+      <span class="vs-num">${voiceScore.score}</span>/100 <span class="vs-trend">${voiceScore.trend === '+' ? '↑' : voiceScore.trend === '-' ? '↓' : '→'}</span>
+    </div>
+  </div>
   <div class="header-right">${req.user ? '<span style="color:#4ade80">' + escapeHtml(req.user.name) + '</span> · <span>' + req.user.credits + ' credits</span> · <a href="/logout" style="color:#888;text-decoration:none">Logout</a>' : ''}</div>
 </div>
 
@@ -3025,9 +3526,12 @@ h1{font-size:20px;margin-bottom:2px}
   <a class="tab ${tab==='twitter'?'active':''}" href="/dashboard?tab=twitter">Tweets<span class="cnt">${counts.twitter}</span></a>
   <a class="tab ${tab==='linkedin'?'active':''}" href="/dashboard?tab=linkedin">LinkedIn<span class="cnt">${counts.linkedin}</span></a>
   <a class="tab ${tab==='reels'?'active':''}" href="/dashboard?tab=reels">Reels<span class="cnt">${counts.reels}</span></a>
+  <a class="tab ${tab==='blog'?'active':''}" href="/dashboard?tab=blog">Blog<span class="cnt">${counts.blog}</span></a>
+  <a class="tab ${tab==='email'?'active':''}" href="/dashboard?tab=email">Email<span class="cnt">${counts.email}</span></a>
   <a class="tab ${tab==='stories'?'active':''}" href="/dashboard?tab=stories">Stories<span class="cnt">${counts.stories}</span></a>
+  <a class="tab ${tab==='calendar'?'active':''}" href="/dashboard?tab=calendar">Cal</a>
   <a class="tab ${tab==='approved'?'active':''}" href="/dashboard?tab=approved">All<span class="cnt">${counts.approved}</span></a>
-  <a class="tab ${tab==='settings'?'active':''}" href="/dashboard?tab=settings" style="flex:0.6">⚙</a>
+  <a class="tab ${tab==='settings'?'active':''}" href="/dashboard?tab=settings" style="flex:0.5">⚙</a>
 </div>
 
 <!-- LinkedIn modal -->
@@ -3107,12 +3611,496 @@ function addStoryDash(){var st=document.getElementById('newStory').value.trim(),
 function deleteStory(id){if(!confirm('Delete this story?'))return;fetch('/api/stories/'+id,{method:'DELETE'}).then(function(){location.reload()})}
 // Trust functions
 function setChannelTrust(ch,lvl){fetch('/api/trust',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch,level:parseInt(lvl)})}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast(ch+' trust set to '+lvl);document.getElementById('trustStatus').textContent=ch+' trust level saved.'}else{document.getElementById('trustStatus').textContent='Failed.'}})}
+// Ghost Mode
+function toggleGhost(on){fetch('/api/ghost-mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:on,platform:'twitter'})}).then(function(r){return r.json()}).then(function(d){if(d.ok)showToast('Ghost Mode '+(on?'enabled':'disabled'))})}
+function setGhostThreshold(v){fetch('/api/ghost-mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold:parseInt(v)})}).then(function(r){return r.json()}).then(function(d){if(d.ok)showToast('Threshold set to '+v)})}
+// Watch Accounts
+function addWatch(){var u=document.getElementById('newWatch').value.trim().replace('@','');if(!u)return;fetch('/api/watch-accounts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('@'+u+' added');location.reload()}})}
+function removeWatch(u){fetch('/api/watch-accounts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,action:'remove'})}).then(function(){location.reload()})}
+function scanWatch(){var s=document.getElementById('watchStatus');s.textContent='Scanning...';fetch('/api/watch-accounts/scan',{method:'POST',headers:{'Content-Type':'application/json'}}).then(function(r){return r.json()}).then(function(d){if(d.ok){var txt=d.results.map(function(r){return '@'+r.username+': '+r.posts.length+' recent'}).join(', ');s.textContent='Scanned: '+txt}else s.textContent='Scan failed'})}
+// Preferences
+function addRule(){var r=document.getElementById('newRule').value.trim();if(!r)return;fetch('/api/preferences/rule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rule:r})}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('Rule added');document.getElementById('ruleStatus').textContent='Rule saved ('+d.total_rules+' total).';document.getElementById('newRule').value=''}})}
+// Newsletter
+function genNewsletter(){var s=document.getElementById('genStatus');s.textContent='Assembling newsletter...';fetch('/api/newsletter/generate',{method:'POST',headers:{'Content-Type':'application/json'}}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('Newsletter generated!');s.textContent='Done — check pending.';setTimeout(function(){location.reload()},1000)}else s.textContent=d.error||'Failed'})}
+// Thread
+function genThread(){var t=document.getElementById('genTopic');var topic=t?t.value:'';var s=document.getElementById('genStatus');s.textContent='Planning thread arc...';fetch('/api/thread',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topic:topic,arc_type:'contrarian'})}).then(function(r){return r.json()}).then(function(d){if(d.ok){showToast('Thread generated (coherence:'+d.coherence_score+')');s.textContent='Thread ready. Reload to review.';setTimeout(function(){location.reload()},1000)}else s.textContent=d.error||'Failed'})}
+// Generate helper updated for new platforms
+function generate(style){var s=document.getElementById('genStatus');var t=document.getElementById('genTopic');s.textContent='Generating...';fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({style:style,platform:style==='blog'?'blog':style==='email'?'email':style==='linkedin'?'linkedin':style==='reels'?'reels':'twitter',topic:t?t.value:''})}).then(function(r){return r.json()}).then(function(d){if(d.ok){s.textContent='Done!'+(d.ghost_published?' (Ghost published!)':'');showToast(d.platform+' content generated');setTimeout(function(){location.reload()},1000)}else{s.textContent=d.error||'Failed'}}).catch(function(e){s.textContent='Error: '+e.message})}
 
 if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();
 var lastPC=${pendingCount};
 setInterval(function(){fetch('/api/pending').then(function(r){return r.json()}).then(function(d){var n=d.total||0;if(n>lastPC&&Notification.permission==='granted')new Notification('Content Machine',{body:(n-lastPC)+' new posts ready'});lastPC=n;document.title=n>0?'('+n+') Content Machine':'Content Machine'})},300000);
 </script></body></html>`;
   res.type('html').send(html);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SPRINT 2 API ENDPOINTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Voice Score V1 ──────────────────────────────────────────────────────────
+app.get('/api/voice-score', (req, res) => {
+  const score = calculateVoiceScore(req.userDataDir);
+  res.json(score);
+});
+
+// ── Ghost Mode V1 ───────────────────────────────────────────────────────────
+app.get('/api/ghost-mode', (req, res) => {
+  res.json(getGhostModeSettings(req.userDataDir));
+});
+
+app.post('/api/ghost-mode', (req, res) => {
+  const settings = getGhostModeSettings(req.userDataDir);
+  const { enabled, platform, threshold } = req.body;
+  if (typeof enabled === 'boolean') {
+    if (platform) { settings.platforms = settings.platforms || {}; settings.platforms[platform] = enabled; }
+    else settings.enabled = enabled;
+  }
+  if (typeof threshold === 'number' && threshold >= 7 && threshold <= 10) settings.threshold = threshold;
+  saveGhostModeSettings(req.userDataDir, settings);
+  res.json({ ok: true, settings });
+});
+
+// Ghost Mode auto-publish check (called after generation)
+async function ghostModeCheck(userDataDir, post) {
+  const settings = getGhostModeSettings(userDataDir);
+  if (!settings.enabled && !(settings.platforms || {})[post.platform]) return false;
+  if (post.platform !== 'twitter') return false; // V1: Twitter only
+
+  // AHA score gate
+  try {
+    const ahaProm = 'Score this content 1-10 on: (1) does it connect two things the reader hasn\'t connected? (2) is there a specific story or number? (3) would someone screenshot this?\nContent: "' + post.content + '"\nReturn ONLY a number 1-10.';
+    const scoreStr = await callGroq('You are a content quality scorer.', ahaProm, { temperature: 0.2, max_tokens: 10 });
+    const ahaScore = parseInt(scoreStr);
+    if (isNaN(ahaScore) || ahaScore < (settings.threshold || 8)) return false;
+
+    // Auto-publish
+    const pubDir = path.join(userDataDir, 'published');
+    const pendDir = path.join(userDataDir, 'pending');
+    const decDir = path.join(userDataDir, 'decisions');
+    post.published_at = new Date().toISOString();
+    post.status = 'ghost-published';
+    post.ghost_mode = true;
+    post.aha_score = ahaScore;
+    fs.writeFileSync(path.join(pubDir, post.id + '.json'), JSON.stringify(post, null, 2));
+    try { fs.unlinkSync(path.join(pendDir, post.id + '.json')); } catch {}
+    fs.mkdirSync(decDir, { recursive: true });
+    fs.writeFileSync(path.join(decDir, post.id + '.json'), JSON.stringify({ type: 'approved', auto: true, ghost_mode: true, aha_score: ahaScore, post_id: post.id, platform: post.platform, at: new Date().toISOString() }, null, 2));
+
+    // Auto-post to Twitter
+    const tweetResult = await autoPostTwitter(post);
+    if (tweetResult.ok) {
+      post.tweet_id = tweetResult.tweet_id;
+      fs.writeFileSync(path.join(pubDir, post.id + '.json'), JSON.stringify(post, null, 2));
+    }
+
+    // WhatsApp notification
+    const preview = (post.content || '').slice(0, 80);
+    sendWhatsApp('👻 Ghost Mode posted: "' + preview + '..." [AHA:' + ahaScore + ']. Reply UNDO to delete within 1hr.');
+
+    // Track in ghost mode log
+    settings.posts = settings.posts || [];
+    settings.posts.unshift({ id: post.id, content_preview: preview, aha_score: ahaScore, posted_at: new Date().toISOString(), tweet_id: tweetResult.ok ? tweetResult.tweet_id : null });
+    if (settings.posts.length > 50) settings.posts = settings.posts.slice(0, 50);
+    saveGhostModeSettings(userDataDir, settings);
+
+    return true;
+  } catch (e) { console.error('Ghost mode check error:', e.message); return false; }
+}
+
+// ── Engagement Ingestion ────────────────────────────────────────────────────
+app.post('/api/engagement/fetch', async (req, res) => {
+  const pubDir = path.join(req.userDataDir, 'published');
+  const engDir = path.join(req.userDataDir, 'engagement');
+  fs.mkdirSync(engDir, { recursive: true });
+  const posts = readJsonDir(pubDir).filter(p => p.tweet_id && !p.engagement);
+  let fetched = 0;
+  for (const post of posts.slice(0, 20)) {
+    const metrics = await fetchTwitterEngagement(post.tweet_id);
+    if (metrics) {
+      post.engagement = { ...metrics, fetched_at: new Date().toISOString() };
+      fs.writeFileSync(path.join(pubDir, post.id + '.json'), JSON.stringify(post, null, 2));
+      fs.writeFileSync(path.join(engDir, post.id + '.json'), JSON.stringify({ post_id: post.id, tweet_id: post.tweet_id, ...metrics, fetched_at: new Date().toISOString() }, null, 2));
+      fetched++;
+    }
+  }
+  res.json({ ok: true, fetched, total_eligible: posts.length });
+});
+
+// ── Performance Layer — Generate Weekly Learnings ───────────────────────────
+app.post('/api/learnings/generate', async (req, res) => {
+  const pubDir = path.join(req.userDataDir, 'published');
+  const decDir = path.join(req.userDataDir, 'decisions');
+  const stateDir = path.join(req.userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const weekAgo = new Date(Date.now() - 7 * 86400000);
+  const posts = readJsonDir(pubDir).filter(p => new Date(p.published_at) >= weekAgo);
+
+  // Sort by engagement rate if available, else by approval status
+  const withEng = posts.filter(p => p.engagement?.engagement_rate);
+  let topPosts, bottomPosts;
+  if (withEng.length >= 6) {
+    const sorted = [...withEng].sort((a, b) => (b.engagement?.engagement_rate || 0) - (a.engagement?.engagement_rate || 0));
+    topPosts = sorted.slice(0, 3);
+    bottomPosts = sorted.slice(-3);
+  } else {
+    topPosts = posts.slice(0, 3);
+    bottomPosts = posts.slice(-3);
+  }
+
+  const topSummary = topPosts.map(p => '- [' + p.platform + '/' + (p.format || '?') + '] "' + (p.content || '').slice(0, 80) + '" eng:' + (p.engagement?.engagement_rate || 'n/a')).join('\n');
+  const bottomSummary = bottomPosts.map(p => '- [' + p.platform + '/' + (p.format || '?') + '] "' + (p.content || '').slice(0, 80) + '" eng:' + (p.engagement?.engagement_rate || 'n/a')).join('\n');
+
+  try {
+    const learnings = await callGroq(
+      'You analyze content performance and extract actionable learnings.',
+      'Top 3 posts this week:\n' + topSummary + '\n\nBottom 3:\n' + bottomSummary +
+      '\n\nWrite a "THIS WEEK\'S LEARNINGS" block (5-7 bullet points): what worked, what to do more of, what to avoid, what times/formats performed best. Be specific and actionable. Return plain text.',
+      { temperature: 0.5, max_tokens: 500 }
+    );
+    const learningsData = { learnings, generated_at: new Date().toISOString(), top_posts: topPosts.map(p => p.id), bottom_posts: bottomPosts.map(p => p.id) };
+    fs.writeFileSync(path.join(stateDir, 'weekly_learnings.json'), JSON.stringify(learningsData, null, 2));
+    res.json({ ok: true, learnings });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Voice Refinement Signals ────────────────────────────────────────────────
+app.post('/api/voice-signal', async (req, res) => {
+  const { post_id, signal_type, original, edited } = req.body;
+  const stateDir = path.join(req.userDataDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  if (signal_type === 'approved_high') {
+    // Add to real examples pool
+    const ctxFile = path.join(req.userDataDir, 'contexts/default.txt');
+    try {
+      let ctx = fs.readFileSync(ctxFile, 'utf8');
+      const exIdx = ctx.indexOf('REAL EXAMPLES POOL');
+      if (exIdx < 0) ctx += '\n\nREAL EXAMPLES POOL (auto-added from approved posts):\n' + original;
+      else ctx = ctx.slice(0, exIdx) + 'REAL EXAMPLES POOL (auto-added from approved posts):\n' + original + '\n' + ctx.slice(exIdx + 18);
+      fs.writeFileSync(ctxFile, ctx);
+    } catch {}
+  } else if (signal_type === 'rejected') {
+    // Store as negative example
+    try {
+      const reason = await callGroq('You analyze why content was rejected.', 'Voice profile context exists. This post was rejected without edit:\n"' + original + '"\nIn 1-2 sentences, what likely made it off-brand?', { temperature: 0.3, max_tokens: 100 });
+      const negFile = path.join(stateDir, 'negative_examples.json');
+      let negs = [];
+      try { negs = JSON.parse(fs.readFileSync(negFile, 'utf8')); } catch {}
+      negs.unshift({ content_preview: (original || '').slice(0, 100), reason, at: new Date().toISOString() });
+      if (negs.length > 20) negs = negs.slice(0, 20);
+      fs.writeFileSync(negFile, JSON.stringify(negs, null, 2));
+    } catch {}
+  } else if (signal_type === 'edited' && original && edited) {
+    // Extract preference from edit diff
+    try {
+      const pref = await callGroq('You analyze editing patterns to learn preferences.', 'Original: "' + original.slice(0, 300) + '"\nEdited: "' + edited.slice(0, 300) + '"\nWhat changed? What preference does this reveal? One sentence.', { temperature: 0.3, max_tokens: 80 });
+      const prefs = loadPreferences(req.userDataDir);
+      const platform = req.body.platform || 'twitter';
+      prefs[platform] = prefs[platform] || {};
+      prefs[platform].last_edit_learning = pref;
+      prefs[platform].updated_at = new Date().toISOString();
+      savePreferences(req.userDataDir, prefs);
+    } catch {}
+  }
+  res.json({ ok: true });
+});
+
+// ── Preferences API ─────────────────────────────────────────────────────────
+app.get('/api/preferences', (req, res) => {
+  res.json(loadPreferences(req.userDataDir));
+});
+
+app.post('/api/preferences/rule', (req, res) => {
+  const { rule } = req.body;
+  if (!rule) return res.status(400).json({ error: 'rule required' });
+  const prefs = loadPreferences(req.userDataDir);
+  prefs.rules = prefs.rules || [];
+  prefs.rules.push(rule);
+  savePreferences(req.userDataDir, prefs);
+  res.json({ ok: true, total_rules: prefs.rules.length });
+});
+
+// ── Watch Accounts (Competitor Monitoring) ──────────────────────────────────
+app.get('/api/watch-accounts', (req, res) => {
+  res.json(loadWatchAccounts(req.userDataDir));
+});
+
+app.post('/api/watch-accounts', (req, res) => {
+  const { username, action } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+  const data = loadWatchAccounts(req.userDataDir);
+  if (action === 'remove') {
+    data.accounts = data.accounts.filter(a => a.username !== username);
+  } else {
+    if (!data.accounts.find(a => a.username === username)) {
+      data.accounts.push({ username, added_at: new Date().toISOString() });
+    }
+  }
+  saveWatchAccounts(req.userDataDir, data);
+  res.json({ ok: true, accounts: data.accounts });
+});
+
+app.post('/api/watch-accounts/scan', async (req, res) => {
+  const data = loadWatchAccounts(req.userDataDir);
+  const results = [];
+  for (const acct of (data.accounts || []).slice(0, 5)) {
+    try {
+      const searchResult = await new Promise((resolve) => {
+        http.get('http://searxng:8080/search?q=' + encodeURIComponent('from:' + acct.username) + '&format=json&categories=social+media&time_range=day', (r) => {
+          let d = ''; r.on('data', c => d += c); r.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve({ results: [] }); } });
+        }).on('error', () => resolve({ results: [] }));
+      });
+      const posts = (searchResult.results || []).slice(0, 3).map(r => ({ title: r.title, url: r.url, content: (r.content || '').slice(0, 200) }));
+      results.push({ username: acct.username, posts });
+    } catch { results.push({ username: acct.username, posts: [] }); }
+  }
+  data.last_scan = { at: new Date().toISOString(), results };
+  saveWatchAccounts(req.userDataDir, data);
+  res.json({ ok: true, results });
+});
+
+// ── Content Series Planner ──────────────────────────────────────────────────
+app.get('/api/series', (req, res) => {
+  res.json({ series: loadSeries(req.userDataDir) });
+});
+
+app.post('/api/series', genLimiter, async (req, res) => {
+  const { topic } = req.body;
+  if (!topic) return res.status(400).json({ error: 'topic required' });
+  const ctx = buildLayeredPrompt(req.userDataDir, path.join(req.userDataDir, 'published'), path.join(req.userDataDir, 'decisions'), topic, 'twitter');
+  try {
+    const raw = await callGroq(ctx + '\n\nYou plan 5-day content series arcs.',
+      'Plan a 5-day content series on: "' + topic + '"\n\nStructure:\nDay 1: Hook — provocative claim\nDay 2: Counterintuitive insight — why the obvious answer is wrong\nDay 3: Proof — specific story or data\nDay 4: Implication — what this means\nDay 5: Call — what to do now\n\nEach day references the previous. Return ONLY valid JSON:\n{"title":"series title","days":[{"day":1,"theme":"...","angle":"...","hook_direction":"..."},...]}\n',
+      { temperature: 0.8, max_tokens: 800 });
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON');
+    const plan = JSON.parse(jsonMatch[0]);
+    plan.id = generateId();
+    plan.topic = topic;
+    plan.created_at = new Date().toISOString();
+    plan.status = 'planned';
+    const series = loadSeries(req.userDataDir);
+    series.unshift(plan);
+    saveSeries(req.userDataDir, series);
+    res.json({ ok: true, series: plan });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/series/:id/generate', genLimiter, async (req, res) => {
+  const series = loadSeries(req.userDataDir);
+  const s = series.find(x => x.id === req.params.id);
+  if (!s) return res.status(404).json({ error: 'Series not found' });
+  const pendDir = path.join(req.userDataDir, 'pending');
+  const ctx = buildLayeredPrompt(req.userDataDir, path.join(req.userDataDir, 'published'), path.join(req.userDataDir, 'decisions'), s.topic, 'twitter');
+  const postIds = [];
+  for (const day of (s.days || [])) {
+    try {
+      const content = await callGroq(ctx + '\n\nThis is day ' + day.day + ' of a 5-day series on "' + s.topic + '". Theme: ' + day.theme + '. Angle: ' + day.angle,
+        'Write a tweet for day ' + day.day + '. Hook direction: ' + day.hook_direction + '. Under 280 chars. Raw, specific, references previous days if day>1. Return ONLY the tweet text.',
+        { temperature: 0.85, max_tokens: 200 });
+      const id = generateId();
+      fs.writeFileSync(path.join(pendDir, id + '.json'), JSON.stringify({ id, platform: 'twitter', content, pillar: s.topic, format: 'series_day' + day.day, series_id: s.id, series_day: day.day, created_at: new Date().toISOString(), status: 'pending' }, null, 2));
+      postIds.push(id);
+    } catch {}
+  }
+  s.status = 'generated';
+  s.post_ids = postIds;
+  saveSeries(req.userDataDir, series);
+  res.json({ ok: true, post_ids: postIds });
+});
+
+// ── Repurpose Old Hits ──────────────────────────────────────────────────────
+app.get('/api/repurpose-hits', async (req, res) => {
+  const pubDir = path.join(req.userDataDir, 'published');
+  const posts = readJsonDir(pubDir);
+  const now = Date.now();
+  const ninetyDays = 90 * 86400000;
+  const oneEightyDays = 180 * 86400000;
+  const oldHits = posts.filter(p => {
+    const age = now - new Date(p.published_at).getTime();
+    return age >= ninetyDays && age <= oneEightyDays && !p.repurposed;
+  });
+  // Sort by engagement if available, else by recency
+  oldHits.sort((a, b) => (b.engagement?.engagement_rate || 0) - (a.engagement?.engagement_rate || 0));
+  const hits = oldHits.slice(0, 5).map(p => ({
+    id: p.id, platform: p.platform, content: (p.content || '').slice(0, 200),
+    published_at: p.published_at, engagement: p.engagement || null
+  }));
+  res.json({ hits });
+});
+
+app.post('/api/repurpose-hit/:id', genLimiter, async (req, res) => {
+  const pubDir = path.join(req.userDataDir, 'published');
+  const pendDir = path.join(req.userDataDir, 'pending');
+  const file = path.join(pubDir, req.params.id + '.json');
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'not found' });
+  const original = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const ctx = buildLayeredPrompt(req.userDataDir, pubDir, path.join(req.userDataDir, 'decisions'), original.pillar, 'twitter');
+  try {
+    const fresh = await callGroq(ctx, 'This post from ' + (original.published_at || '').slice(0, 10) + ' performed well:\n"' + original.content + '"\n\nRewrite it with a completely fresh angle — different framework, different hook, updated for today. Same core insight. Under 280 chars. Return ONLY the tweet.', { temperature: 0.9, max_tokens: 200 });
+    const id = generateId();
+    fs.writeFileSync(path.join(pendDir, id + '.json'), JSON.stringify({ id, platform: 'twitter', content: fresh, pillar: original.pillar, format: 'repurposed_hit', source_post_id: original.id, created_at: new Date().toISOString(), status: 'pending' }, null, 2));
+    original.repurposed = true;
+    fs.writeFileSync(file, JSON.stringify(original, null, 2));
+    res.json({ ok: true, id, content: fresh });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Weekly Newsletter Assembly ──────────────────────────────────────────────
+app.post('/api/newsletter/generate', genLimiter, async (req, res) => {
+  const pubDir = path.join(req.userDataDir, 'published');
+  const pendDir = path.join(req.userDataDir, 'pending');
+  const weekAgo = new Date(Date.now() - 7 * 86400000);
+  const posts = readJsonDir(pubDir).filter(p => new Date(p.published_at) >= weekAgo);
+  if (posts.length === 0) return res.status(400).json({ error: 'No posts this week to curate' });
+
+  // Pick top 5 by engagement or recency
+  posts.sort((a, b) => (b.engagement?.engagement_rate || 0) - (a.engagement?.engagement_rate || 0));
+  const bestPosts = posts.slice(0, 5);
+  const postSummaries = bestPosts.map((p, i) => (i+1) + '. [' + p.platform + '] "' + (p.content || '').slice(0, 120) + '"').join('\n');
+
+  const ctx = buildLayeredPrompt(req.userDataDir, pubDir, path.join(req.userDataDir, 'decisions'), 'weekly newsletter', 'email');
+  try {
+    const newsletter = await callGroq(ctx + '\n\nYou write weekly newsletters in the user\'s voice.',
+      'This week\'s top content:\n' + postSummaries + '\n\nWrite a weekly newsletter:\n- Personal intro paragraph\n- Each selected post with 1-sentence context\n- Forward-looking CTA\n- Sign-off\n\nAlso include: subject_line, preview_text (under 90 chars)\n\nReturn JSON: {"subject_line":"...","preview_text":"...","body":"full newsletter text"}',
+      { temperature: 0.7, max_tokens: 1200 });
+    const jsonMatch = newsletter.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON');
+    const nl = JSON.parse(jsonMatch[0]);
+    const id = generateId();
+    fs.writeFileSync(path.join(pendDir, id + '.json'), JSON.stringify({ id, platform: 'email', content: nl.body, format: 'weekly_newsletter', subject_line: nl.subject_line, preview_text: nl.preview_text, created_at: new Date().toISOString(), status: 'pending' }, null, 2));
+    res.json({ ok: true, id, newsletter: nl });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Thread-First Generation ─────────────────────────────────────────────────
+app.post('/api/thread', genLimiter, async (req, res) => {
+  const { topic, arc_type } = req.body;
+  const pendDir = path.join(req.userDataDir, 'pending');
+  const ctx = buildLayeredPrompt(req.userDataDir, path.join(req.userDataDir, 'published'), path.join(req.userDataDir, 'decisions'), topic, 'twitter');
+
+  const arcTypes = {
+    argument: 'Argument arc: here\'s why X is wrong → evidence → implication',
+    story: 'Story arc: setup → conflict → resolution → lesson',
+    tutorial: 'Tutorial arc: problem → step 1 → step 2 → result',
+    contrarian: 'Contrarian arc: popular belief → why it\'s wrong → what\'s actually true → what to do'
+  };
+  const chosenArc = arcTypes[arc_type] || arcTypes.contrarian;
+
+  try {
+    // Step 1: Plan the arc
+    const arcPlan = await callGroq(ctx + '\n\nYou plan Twitter thread arcs.',
+      'Topic: "' + (topic || 'pick something from your worldview') + '"\nArc type: ' + chosenArc +
+      '\n\nPlan a 7-tweet thread arc. Return ONLY valid JSON:\n{"arc":"one-line arc summary","tweets":[{"role":"hook","direction":"..."},{"role":"setup","direction":"..."},{"role":"twist","direction":"..."},{"role":"evidence","direction":"..."},{"role":"implication","direction":"..."},{"role":"deeper","direction":"..."},{"role":"cta","direction":"..."}]}',
+      { temperature: 0.8, max_tokens: 500 });
+    const arcMatch = arcPlan.match(/\{[\s\S]*\}/);
+    if (!arcMatch) throw new Error('No arc plan JSON');
+    const plan = JSON.parse(arcMatch[0]);
+
+    // Step 2: Generate full thread
+    const threadPrompt = 'Thread arc plan:\n' + JSON.stringify(plan.tweets) +
+      '\n\nWrite the full 7-tweet thread. Each tweet under 280 chars. The hook creates a curiosity gap. Each tweet flows to the next. The CTA resolves everything.\n' +
+      'Return ONLY valid JSON array of 7 strings: ["tweet1","tweet2",...]';
+    const threadRaw = await callGroq(ctx, threadPrompt, { temperature: 0.85, max_tokens: 1500 });
+    const threadMatch = threadRaw.match(/\[[\s\S]*\]/);
+    if (!threadMatch) throw new Error('No thread JSON');
+    const tweets = JSON.parse(threadMatch[0]);
+
+    // Step 3: Coherence check
+    const coherencePrompt = 'Thread:\n' + tweets.map((t, i) => (i+1) + '. ' + t).join('\n') + '\n\nScore 1-10: does tweet 1 create a question that the thread answers? Does the last tweet resolve it? Any redundancy? Return ONLY a number.';
+    const coherenceStr = await callGroq('You check thread coherence.', coherencePrompt, { temperature: 0.2, max_tokens: 10 });
+    const coherenceScore = parseInt(coherenceStr) || 7;
+
+    const threadContent = tweets.map((t, i) => (i === 0 ? t : (i+1) + '/ ' + t)).join('\n\n---\n\n');
+    const id = generateId();
+    const imagePrompt = generateImagePrompt(tweets[0], 'twitter');
+    fs.writeFileSync(path.join(pendDir, id + '.json'), JSON.stringify({ id, platform: 'twitter', content: threadContent, pillar: topic || 'Thread', format: 'thread', arc_type: arc_type || 'contrarian', coherence_score: coherenceScore, image_prompt: imagePrompt, tweets, created_at: new Date().toISOString(), status: 'pending' }, null, 2));
+
+    res.json({ ok: true, id, tweets, coherence_score: coherenceScore, arc: plan.arc, image_prompt: imagePrompt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Morning Inbox / Package ─────────────────────────────────────────────────
+app.get('/api/inbox', (req, res) => {
+  const pkg = getTodayPackage(req.userDataDir);
+  if (pkg) return res.json(pkg);
+  // Build package from current pending
+  const pendDir = path.join(req.userDataDir, 'pending');
+  const pending = readJsonDir(pendDir);
+  const today = new Date().toISOString().slice(0, 10);
+  const todayPending = pending.filter(p => (p.created_at || '').startsWith(today));
+  const newPkg = {
+    date: today,
+    items: todayPending.map(p => ({ id: p.id, platform: p.platform, format: p.format, content_preview: (p.content || '').slice(0, 100), status: 'pending' })),
+    total: todayPending.length,
+    actioned: 0,
+    complete: false,
+    created_at: new Date().toISOString()
+  };
+  saveTodayPackage(req.userDataDir, newPkg);
+  res.json(newPkg);
+});
+
+app.post('/api/inbox/bulk', actionLimiter, async (req, res) => {
+  const { approve, skip } = req.body;
+  const pendDir = path.join(req.userDataDir, 'pending');
+  const pubDir = path.join(req.userDataDir, 'published');
+  const decDir = path.join(req.userDataDir, 'decisions');
+  const pending = readJsonDir(pendDir);
+  let approvedCount = 0, skippedCount = 0;
+
+  for (const idx of (approve || [])) {
+    const post = pending[idx - 1];
+    if (!post) continue;
+    post.published_at = new Date().toISOString();
+    post.status = 'published';
+    delete post.created_at;
+    fs.writeFileSync(path.join(pubDir, post.id + '.json'), JSON.stringify(post, null, 2));
+    try { fs.unlinkSync(path.join(pendDir, post.id + '.json')); } catch {}
+    fs.mkdirSync(decDir, { recursive: true });
+    fs.writeFileSync(path.join(decDir, post.id + '.json'), JSON.stringify({ type: 'approved', post_id: post.id, platform: post.platform, at: new Date().toISOString() }, null, 2));
+    approvedCount++;
+  }
+
+  for (const idx of (skip || [])) {
+    const post = pending[idx - 1];
+    if (!post) continue;
+    try { fs.unlinkSync(path.join(pendDir, post.id + '.json')); } catch {}
+    fs.mkdirSync(decDir, { recursive: true });
+    fs.writeFileSync(path.join(decDir, post.id + '.json'), JSON.stringify({ type: 'rejected', post_id: post.id, platform: post.platform, at: new Date().toISOString() }, null, 2));
+    skippedCount++;
+  }
+
+  // Update package
+  const pkg = getTodayPackage(req.userDataDir);
+  if (pkg) {
+    pkg.actioned = (pkg.actioned || 0) + approvedCount + skippedCount;
+    pkg.complete = pkg.actioned >= pkg.total;
+    saveTodayPackage(req.userDataDir, pkg);
+  }
+
+  res.json({ ok: true, approved: approvedCount, skipped: skippedCount });
+});
+
+// ── Calendar API ────────────────────────────────────────────────────────────
+app.get('/api/calendar', (req, res) => {
+  const pubDir = path.join(req.userDataDir, 'published');
+  const pendDir = path.join(req.userDataDir, 'pending');
+  const posts = readJsonDir(pubDir);
+  const pending = readJsonDir(pendDir);
+  const days = [];
+  for (let i = -3; i <= 3; i++) {
+    const d = new Date(Date.now() + i * 86400000);
+    const dateStr = d.toISOString().slice(0, 10);
+    const dayPosts = posts.filter(p => (p.published_at || '').startsWith(dateStr)).map(p => ({ id: p.id, platform: p.platform, content_preview: (p.content || '').slice(0, 80), status: 'published', time: p.published_at }));
+    const dayPending = pending.filter(p => (p.scheduled_for || p.created_at || '').startsWith(dateStr)).map(p => ({ id: p.id, platform: p.platform, content_preview: (p.content || '').slice(0, 80), status: p.scheduled_for ? 'scheduled' : 'pending', time: p.scheduled_for || p.created_at }));
+    days.push({ date: dateStr, label: d.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' }), isToday: i === 0, posts: [...dayPosts, ...dayPending] });
+  }
+  // Week stats
+  const thisWeek = posts.filter(p => new Date(p.published_at) >= new Date(Date.now() - 7 * 86400000));
+  const platforms = [...new Set(thisWeek.map(p => p.platform))];
+  res.json({ days, stats: { total: thisWeek.length, platforms, pending: pending.length } });
 });
 
 // ── RSS Feed (aggregates all tenants) ─────────────────────────────────────────

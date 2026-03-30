@@ -85,8 +85,21 @@ services:
       - INTRKT_BASE_URL=${INTRKT_BASE_URL}
       - INTRKT_API_KEY=${INTRKT_API_KEY}
       - INTRKT_OPERATOR_PHONE=${INTRKT_OPERATOR_PHONE}
+      - MONGODB_URI=mongodb://${MONGO_USER:-contentmachine}:${MONGO_PASS:-cm2026secure}@mongodb:27017/contentmachine?authSource=admin
     volumes:
       - content_data:/data
+    networks:
+      - cm_net
+
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    restart: always
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USER:-contentmachine}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASS:-cm2026secure}
+    volumes:
+      - mongo_data:/data/db
     networks:
       - cm_net
 
@@ -101,6 +114,7 @@ volumes:
   n8n_data:
   ollama_data:
   content_data:
+  mongo_data:
 
 networks:
   cm_net:
